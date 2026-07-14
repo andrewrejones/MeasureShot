@@ -6,6 +6,7 @@
 //
 
 import SwiftUI
+import CoreImage
 
 struct EditorView: View {
     @Environment(AppState.self) private var appState
@@ -213,6 +214,7 @@ private enum AnnotationEndpoint {
     case start
     case end
     case third
+    case fourth
 }
 
 private struct EditorCanvas: View {
@@ -220,6 +222,9 @@ private struct EditorCanvas: View {
 
     @State private var lastDragPoint: CGPoint?
     @State private var draggedEndpoint: AnnotationEndpoint?
+    @State private var colourPickerLocation: CGPoint?
+    @State private var colourPickerPreview: NSColor?
+    @State private var blurBrushLocation: CGPoint?
     @FocusState private var isCanvasFocused: Bool
 
     var body: some View {
@@ -245,6 +250,16 @@ private struct EditorCanvas: View {
                                     height: image.size.height * effectiveScale
                                 )
 
+                            if appState.isAnnotationLayerVisible {
+                                BlurOverlay(
+                                    image: image,
+                                    annotations: appState.annotations.filter { $0.type == .blur },
+                                    inProgress: blurPreview,
+                                    scale: effectiveScale,
+                                    showMask: appState.showBlurMask
+                                )
+                            }
+
                             if appState.isGuideLayerVisible {
                                 Color.clear
                             }
@@ -265,7 +280,12 @@ private struct EditorCanvas: View {
                             if appState.isAnnotationLayerVisible {
                                 AnnotationOverlay(
                                     annotations: appState.annotations.filter {
-                                        $0.type == .arrow || $0.type == .line || $0.type == .rectangle || $0.type == .ellipse
+                                        $0.type == .arrow
+                                            || $0.type == .line
+                                            || $0.type == .rectangle
+                                            || $0.type == .ellipse
+                                            || $0.type == .text
+                                            || $0.type == .blur
                                     },
                                     inProgress: annotationPreview,
                                     selectedAnnotationID: appState.selectedAnnotationID,
@@ -280,6 +300,82 @@ private struct EditorCanvas: View {
                             height: image.size.height * effectiveScale
                         )
                         .contentShape(Rectangle())
+                        .onContinuousHover { phase in
+                            if appState.selectedTool == .blur {
+                                switch phase {
+                                case .active(let location):
+                                    blurBrushLocation = location
+                                case .ended:
+                                    blurBrushLocation = nil
+                                }
+                                colourPickerLocation = nil
+                                colourPickerPreview = nil
+                                return
+                            }
+
+                            blurBrushLocation = nil
+
+                            guard appState.selectedTool == .colourPicker else {
+                                colourPickerLocation = nil
+                                colourPickerPreview = nil
+                                return
+                            }
+
+                            switch phase {
+                            case .active(let location):
+                                colourPickerLocation = location
+                                colourPickerPreview = colourAtCanvasPoint(
+                                    location,
+                                    scale: effectiveScale,
+                                    imageSize: image.size
+                                )
+                            case .ended:
+                                colourPickerLocation = nil
+                                colourPickerPreview = nil
+                            }
+                        }
+                        .overlay {
+                            if appState.selectedTool == .colourPicker,
+                               let location = colourPickerLocation,
+                               let preview = colourPickerPreview {
+                                ZStack {
+                                    Circle()
+                                        .fill(Color(preview).opacity(0.35))
+
+                                    Circle()
+                                        .stroke(.white, lineWidth: 2)
+
+                                    Circle()
+                                        .stroke(.black.opacity(0.65), lineWidth: 1)
+                                        .padding(2)
+
+                                    Image(systemName: "plus")
+                                        .font(.system(size: 10, weight: .bold))
+                                        .foregroundStyle(.white)
+                                        .shadow(radius: 1)
+                                }
+                                .frame(width: 24, height: 24)
+                                .position(location)
+                                .allowsHitTesting(false)
+                            }
+
+                            if appState.selectedTool == .blur,
+                               let location = blurBrushLocation {
+                                Circle()
+                                    .stroke(.white, lineWidth: 2)
+                                    .background(
+                                        Circle()
+                                            .stroke(.black.opacity(0.7), lineWidth: 1)
+                                            .padding(2)
+                                    )
+                                    .frame(
+                                        width: appState.defaultBlurBrushSize * effectiveScale,
+                                        height: appState.defaultBlurBrushSize * effectiveScale
+                                    )
+                                    .position(location)
+                                    .allowsHitTesting(false)
+                            }
+                        }
                         .focusable()
                         .focused($isCanvasFocused)
                         .onDeleteCommand {
@@ -322,11 +418,19 @@ private struct EditorCanvas: View {
     private var annotationPreview: MSAnnotation? {
         guard let annotation = appState.inProgressAnnotation else { return nil }
         switch annotation.type {
-        case .arrow, .line, .rectangle, .ellipse:
+        case .arrow, .line, .rectangle, .ellipse, .blur:
             return annotation
         default:
             return nil
         }
+    }
+
+    private var blurPreview: MSAnnotation? {
+        guard let annotation = appState.inProgressAnnotation,
+              annotation.type == .blur else {
+            return nil
+        }
+        return annotation
     }
 
     private var measurementPreview: MSAnnotation? {
@@ -345,7 +449,15 @@ private struct EditorCanvas: View {
                 isCanvasFocused = true
                 let imagePoint = clampedImagePoint(value.location, scale: scale, imageSize: imageSize)
 
+                if appState.selectedTool == .blur {
+                    blurBrushLocation = value.location
+                }
+
                 if appState.selectedTool == .colourPicker {
+                    return
+                }
+
+                if appState.selectedTool == .text {
                     return
                 }
 
@@ -370,6 +482,8 @@ private struct EditorCanvas: View {
                             appState.updateSelectedAnnotationEndpoint(isStart: false, to: imagePoint)
                         case .third:
                             appState.updateSelectedAngleThirdPoint(to: imagePoint)
+                        case .fourth:
+                            appState.updateSelectedAngleFourthPoint(to: imagePoint)
                         }
                         self.lastDragPoint = imagePoint
                         return
@@ -401,15 +515,27 @@ private struct EditorCanvas: View {
                 defer {
                     lastDragPoint = nil
                     draggedEndpoint = nil
+                    if appState.selectedTool == .blur {
+                        blurBrushLocation = value.location
+                    }
                 }
 
                 if appState.selectedTool == .colourPicker {
+                    sampleColour(
+                        atCanvasPoint: value.location,
+                        scale: scale,
+                        imageSize: imageSize
+                    )
+                    return
+                }
+
+                if appState.selectedTool == .text {
                     let imagePoint = clampedImagePoint(
                         value.location,
                         scale: scale,
                         imageSize: imageSize
                     )
-                    sampleColour(at: imagePoint)
+                    appState.beginAnnotation(type: .text, at: imagePoint)
                     return
                 }
 
@@ -446,6 +572,11 @@ private struct EditorCanvas: View {
             return .third
         }
 
+        if let fourthPoint = annotation.fourthPoint,
+           hypot(point.x - fourthPoint.x, point.y - fourthPoint.y) <= tolerance {
+            return .fourth
+        }
+
         return nil
     }
 
@@ -476,23 +607,43 @@ private struct EditorCanvas: View {
                     to: annotation.end
                 ) <= 8
 
-                let measuredHit: Bool
+                let perpendicularHit: Bool
                 if let thirdPoint = annotation.thirdPoint {
-                    measuredHit = distanceFromPoint(
+                    perpendicularHit = distanceFromPoint(
                         point,
                         toSegmentFrom: annotation.end,
                         to: thirdPoint
                     ) <= 8
                 } else {
+                    perpendicularHit = false
+                }
+
+                let measuredHit: Bool
+                if let thirdPoint = annotation.thirdPoint,
+                   let fourthPoint = annotation.fourthPoint {
+                    measuredHit = distanceFromPoint(
+                        point,
+                        toSegmentFrom: thirdPoint,
+                        to: fourthPoint
+                    ) <= 8
+                } else {
                     measuredHit = false
                 }
 
-                if baselineHit || measuredHit {
+                if baselineHit || perpendicularHit || measuredHit {
                     return annotation.id
                 }
 
-            case .text, .blur:
-                if annotation.normalizedRect.insetBy(dx: -8, dy: -8).contains(point) {
+            case .text:
+                if textBounds(for: annotation).insetBy(dx: -8, dy: -8).contains(point) {
+                    return annotation.id
+                }
+
+            case .blur:
+                let tolerance = CGFloat(annotation.blurBrushSize / 2 + 8)
+                if annotation.points.contains(where: {
+                    hypot(point.x - $0.x, point.y - $0.y) <= tolerance
+                }) {
                     return annotation.id
                 }
             }
@@ -501,18 +652,73 @@ private struct EditorCanvas: View {
         return nil
     }
 
-    private func sampleColour(at point: CGPoint) {
+    private func textBounds(for annotation: MSAnnotation) -> CGRect {
+        let width = max(
+            60,
+            CGFloat(annotation.text.count) * annotation.fontSize * 0.58
+        )
+        let height = max(24, annotation.fontSize * 1.4)
+
+        return CGRect(
+            x: annotation.start.x,
+            y: annotation.start.y - height,
+            width: width,
+            height: height
+        )
+    }
+    private func colourAtCanvasPoint(
+        _ point: CGPoint,
+        scale: CGFloat,
+        imageSize: CGSize
+    ) -> NSColor? {
         guard let image = appState.currentImage,
               let tiff = image.tiffRepresentation,
               let bitmap = NSBitmapImageRep(data: tiff) else {
+            return nil
+        }
+
+        let displayedWidth = max(imageSize.width * scale, 1)
+        let displayedHeight = max(imageSize.height * scale, 1)
+
+        let normalizedX = min(max(point.x / displayedWidth, 0), 1)
+        let normalizedY = min(max(point.y / displayedHeight, 0), 1)
+
+        let pixelX = min(
+            max(Int(normalizedX * CGFloat(bitmap.pixelsWide)), 0),
+            bitmap.pixelsWide - 1
+        )
+        let pixelYFromTop = min(
+            max(Int(normalizedY * CGFloat(bitmap.pixelsHigh)), 0),
+            bitmap.pixelsHigh - 1
+        )
+        let pixelY = bitmap.pixelsHigh - 1 - pixelYFromTop
+
+        return bitmap.colorAt(x: pixelX, y: pixelY)
+    }
+
+    private func hexString(for colour: NSColor) -> String {
+        let rgb = colour.usingColorSpace(.deviceRGB) ?? colour
+        return String(
+            format: "#%02X%02X%02X",
+            Int(rgb.redComponent * 255),
+            Int(rgb.greenComponent * 255),
+            Int(rgb.blueComponent * 255)
+        )
+    }
+
+    private func sampleColour(
+        atCanvasPoint point: CGPoint,
+        scale: CGFloat,
+        imageSize: CGSize
+    ) {
+        guard let colour = colourAtCanvasPoint(
+            point,
+            scale: scale,
+            imageSize: imageSize
+        ) else {
             return
         }
 
-        let x = min(max(Int(point.x.rounded()), 0), bitmap.pixelsWide - 1)
-        let yFromTop = min(max(Int(point.y.rounded()), 0), bitmap.pixelsHigh - 1)
-        let y = bitmap.pixelsHigh - 1 - yFromTop
-
-        guard let colour = bitmap.colorAt(x: x, y: y) else { return }
         appState.updateSampledColor(colour)
     }
 
@@ -531,6 +737,152 @@ private struct EditorCanvas: View {
         )
         let projection = CGPoint(x: start.x + t * dx, y: start.y + t * dy)
         return hypot(point.x - projection.x, point.y - projection.y)
+    }
+}
+
+
+private struct BlurOverlay: View {
+    let image: NSImage
+    let annotations: [MSAnnotation]
+    let inProgress: MSAnnotation?
+    let scale: CGFloat
+    let showMask: Bool
+
+    var body: some View {
+        ZStack {
+            ForEach(allBlurAnnotations) { annotation in
+                blurStrokeView(annotation)
+            }
+        }
+        .frame(
+            width: image.size.width * scale,
+            height: image.size.height * scale
+        )
+        .allowsHitTesting(false)
+    }
+
+    @ViewBuilder
+    private func blurStrokeView(_ annotation: MSAnnotation) -> some View {
+        let displayedWidth = image.size.width * scale
+        let displayedHeight = image.size.height * scale
+
+        if !annotation.points.isEmpty {
+            ZStack {
+                if let blurred = makeBlurredImage(radius: annotation.blurRadius) {
+                    Image(nsImage: blurred)
+                        .resizable()
+                        .interpolation(.high)
+                        .frame(width: displayedWidth, height: displayedHeight)
+                        .mask {
+                            blurMask(for: annotation)
+                        }
+                }
+
+                if showMask {
+                    Color.red.opacity(0.35)
+                        .frame(width: displayedWidth, height: displayedHeight)
+                        .mask {
+                            blurMask(for: annotation)
+                        }
+                }
+            }
+            .frame(width: displayedWidth, height: displayedHeight)
+        }
+    }
+
+    @ViewBuilder
+    private func blurMask(for annotation: MSAnnotation) -> some View {
+        if annotation.points.isEmpty {
+            Color.clear
+        } else {
+            Canvas { context, _ in
+                let diameter = max(2, annotation.blurBrushSize * scale)
+                let radius = diameter / 2
+                let points = interpolatedBrushPoints(
+                    annotation.points,
+                    maximumSpacing: max(1, annotation.blurBrushSize * 0.15)
+                )
+
+                for point in points {
+                    let centre = CGPoint(
+                        x: point.x * scale,
+                        y: point.y * scale
+                    )
+                    let rect = CGRect(
+                        x: centre.x - radius,
+                        y: centre.y - radius,
+                        width: diameter,
+                        height: diameter
+                    )
+                    context.fill(
+                        Path(ellipseIn: rect),
+                        with: .color(.white)
+                    )
+                }
+            }
+            .frame(
+                width: image.size.width * scale,
+                height: image.size.height * scale
+            )
+        }
+    }
+
+    private func makeBlurredImage(radius: Double) -> NSImage? {
+        guard let tiff = image.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiff),
+              let cgInput = bitmap.cgImage,
+              let filter = CIFilter(name: "CIGaussianBlur") else {
+            return nil
+        }
+
+        let input = CIImage(cgImage: cgInput)
+        filter.setValue(input, forKey: kCIInputImageKey)
+        filter.setValue(max(8, radius * 1.5), forKey: kCIInputRadiusKey)
+
+        guard let output = filter.outputImage?.cropped(to: input.extent) else {
+            return nil
+        }
+
+        let ciContext = CIContext(options: nil)
+        guard let cgOutput = ciContext.createCGImage(output, from: input.extent) else {
+            return nil
+        }
+
+        return NSImage(cgImage: cgOutput, size: image.size)
+    }
+
+    private func interpolatedBrushPoints(
+        _ points: [CGPoint],
+        maximumSpacing: Double
+    ) -> [CGPoint] {
+        guard let first = points.first else { return [] }
+        guard points.count > 1 else { return [first] }
+
+        var result = [first]
+
+        for (start, end) in zip(points, points.dropFirst()) {
+            let distance = hypot(end.x - start.x, end.y - start.y)
+            let steps = max(1, Int(ceil(distance / maximumSpacing)))
+
+            for step in 1...steps {
+                let progress = CGFloat(step) / CGFloat(steps)
+                result.append(
+                    CGPoint(
+                        x: start.x + (end.x - start.x) * progress,
+                        y: start.y + (end.y - start.y) * progress
+                    )
+                )
+            }
+        }
+
+        return result
+    }
+
+    private var allBlurAnnotations: [MSAnnotation] {
+        if let inProgress {
+            return annotations + [inProgress]
+        }
+        return annotations
     }
 }
 
@@ -602,10 +954,38 @@ private struct AnnotationOverlay: View {
             let rect = annotation.normalizedRect.applying(CGAffineTransform(scaleX: scale, y: scale))
             context.stroke(Path(ellipseIn: rect), with: .color(color), lineWidth: lineWidth)
 
-        case .text, .blur:
-            break
-        }
+        case .text:
+            let label = Text(annotation.text)
+                .font(.system(size: max(8, annotation.fontSize * scale)))
+                .foregroundColor(color)
 
+            context.draw(
+                label,
+                at: scaled(annotation.start),
+                anchor: .bottomLeading
+            )
+
+        case .blur:
+            if selected {
+                let diameter = annotation.blurBrushSize * scale
+                let radius = diameter / 2
+
+                for point in annotation.points {
+                    let centre = scaled(point)
+                    let rect = CGRect(
+                        x: centre.x - radius,
+                        y: centre.y - radius,
+                        width: diameter,
+                        height: diameter
+                    )
+                    context.stroke(
+                        Path(ellipseIn: rect),
+                        with: .color(.accentColor.opacity(0.7)),
+                        lineWidth: 1
+                    )
+                }
+            }
+        }
         if selected {
             drawSelectionHandles(annotation, in: &context)
         }
@@ -617,37 +997,38 @@ private struct AnnotationOverlay: View {
         lineWidth: CGFloat,
         in context: inout GraphicsContext
     ) {
-        let start = scaled(annotation.start)
-        let vertex = scaled(annotation.end)
+        let baselineStart = scaled(annotation.start)
+        let baselineEnd = scaled(annotation.end)
 
         var baseline = Path()
-        baseline.move(to: start)
-        baseline.addLine(to: vertex)
+        baseline.move(to: baselineStart)
+        baseline.addLine(to: baselineEnd)
         context.stroke(baseline, with: .color(color), lineWidth: lineWidth)
 
         if let thirdPoint = annotation.thirdPoint {
-            let measuredEnd = scaled(thirdPoint)
-            var measuredArm = Path()
-            measuredArm.move(to: vertex)
-            measuredArm.addLine(to: measuredEnd)
-            context.stroke(measuredArm, with: .color(color), lineWidth: lineWidth)
-        }
-
-        if let referencePoint = annotation.perpendicularReferencePoint {
-            var reference = Path()
-            reference.move(to: vertex)
-            reference.addLine(to: scaled(referencePoint))
+            let perpendicularEnd = scaled(thirdPoint)
+            var perpendicular = Path()
+            perpendicular.move(to: baselineEnd)
+            perpendicular.addLine(to: perpendicularEnd)
             context.stroke(
-                reference,
-                with: .color(color.opacity(0.65)),
+                perpendicular,
+                with: .color(color.opacity(0.75)),
                 style: StrokeStyle(
-                    lineWidth: max(1, lineWidth * 0.75),
+                    lineWidth: max(1, lineWidth * 0.8),
                     dash: [6 * scale, 4 * scale]
                 )
             )
         }
 
-        if annotation.thirdPoint != nil {
+        if let thirdPoint = annotation.thirdPoint,
+           let fourthPoint = annotation.fourthPoint {
+            let measuredStart = scaled(thirdPoint)
+            let measuredEnd = scaled(fourthPoint)
+            var measured = Path()
+            measured.move(to: measuredStart)
+            measured.addLine(to: measuredEnd)
+            context.stroke(measured, with: .color(color), lineWidth: lineWidth)
+
             let label = Text(
                 annotation.displayValue(
                     calibration: calibration,
@@ -659,7 +1040,7 @@ private struct AnnotationOverlay: View {
 
             context.draw(
                 label,
-                at: CGPoint(x: vertex.x + 12, y: vertex.y - 18),
+                at: CGPoint(x: measuredStart.x + 12, y: measuredStart.y - 18),
                 anchor: .leading
             )
         }
@@ -718,6 +1099,10 @@ private struct AnnotationOverlay: View {
             points.append(scaled(thirdPoint))
         }
 
+        if let fourthPoint = annotation.fourthPoint {
+            points.append(scaled(fourthPoint))
+        }
+
         for point in points {
             let rect = CGRect(x: point.x - 5, y: point.y - 5, width: 10, height: 10)
             context.fill(Path(ellipseIn: rect), with: .color(.white))
@@ -756,6 +1141,141 @@ private struct InspectorSidebar: View {
         appState.selectedTool == .colourPicker
     }
 
+    private var shouldShowTextPanel: Bool {
+        appState.selectedTool == .text
+            || appState.selectedAnnotation?.type == .text
+    }
+
+    private var shouldShowBlurPanel: Bool {
+        appState.selectedTool == .blur
+            || appState.selectedAnnotation?.type == .blur
+    }
+
+    private var textSection: some View {
+        GroupBox("Text") {
+            VStack(alignment: .leading, spacing: 10) {
+                TextField(
+                    "Text",
+                    text: Binding(
+                        get: {
+                            appState.selectedAnnotation?.type == .text
+                                ? appState.selectedAnnotation?.text ?? appState.defaultText
+                                : appState.defaultText
+                        },
+                        set: { newValue in
+                            appState.defaultText = newValue
+                            if appState.selectedAnnotation?.type == .text {
+                                appState.updateSelectedText(newValue)
+                            }
+                        }
+                    )
+                )
+
+                HStack {
+                    Text("Font Size")
+                    Spacer()
+                    Text("\(Int(appState.selectedAnnotation?.type == .text ? appState.selectedAnnotation?.fontSize ?? appState.defaultFontSize : appState.defaultFontSize)) pt")
+                        .foregroundStyle(.secondary)
+                }
+
+                Slider(
+                    value: Binding(
+                        get: {
+                            Double(
+                                appState.selectedAnnotation?.type == .text
+                                    ? appState.selectedAnnotation?.fontSize ?? appState.defaultFontSize
+                                    : appState.defaultFontSize
+                            )
+                        },
+                        set: { newValue in
+                            appState.defaultFontSize = CGFloat(newValue)
+                            if appState.selectedAnnotation?.type == .text {
+                                appState.updateSelectedFontSize(CGFloat(newValue))
+                            }
+                        }
+                    ),
+                    in: 8...72,
+                    step: 1
+                )
+
+                Text("Click the image to place text, then edit it here.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private var blurSection: some View {
+        GroupBox("Blur") {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("Strength")
+                    Spacer()
+                    Text("\(Int(appState.selectedAnnotation?.type == .blur ? appState.selectedAnnotation?.blurRadius ?? appState.defaultBlurRadius : appState.defaultBlurRadius))")
+                        .foregroundStyle(.secondary)
+                }
+
+                Slider(
+                    value: Binding(
+                        get: {
+                            appState.selectedAnnotation?.type == .blur
+                                ? appState.selectedAnnotation?.blurRadius ?? appState.defaultBlurRadius
+                                : appState.defaultBlurRadius
+                        },
+                        set: { newValue in
+                            appState.defaultBlurRadius = newValue
+                            if appState.selectedAnnotation?.type == .blur {
+                                appState.updateSelectedBlurRadius(newValue)
+                            }
+                        }
+                    ),
+                    in: 4...80,
+                    step: 1
+                )
+
+                HStack {
+                    Text("Brush Size")
+                    Spacer()
+                    Text("\(Int(appState.selectedAnnotation?.type == .blur ? appState.selectedAnnotation?.blurBrushSize ?? appState.defaultBlurBrushSize : appState.defaultBlurBrushSize)) px")
+                        .foregroundStyle(.secondary)
+                }
+
+                Slider(
+                    value: Binding(
+                        get: {
+                            appState.selectedAnnotation?.type == .blur
+                                ? appState.selectedAnnotation?.blurBrushSize ?? appState.defaultBlurBrushSize
+                                : appState.defaultBlurBrushSize
+                        },
+                        set: { newValue in
+                            appState.defaultBlurBrushSize = newValue
+                            if appState.selectedAnnotation?.type == .blur {
+                                appState.updateSelectedBlurBrushSize(newValue)
+                            }
+                        }
+                    ),
+                    in: 10...160,
+                    step: 2
+                )
+
+                Toggle(
+                    "Show Painted Mask",
+                    isOn: Binding(
+                        get: { appState.showBlurMask },
+                        set: { appState.showBlurMask = $0 }
+                    )
+                )
+
+                Text("Drag across the area to blur. Use Select to move or resize it later.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
@@ -765,6 +1285,14 @@ private struct InspectorSidebar: View {
                 activeToolSection
                 instructionsSection
                 appearanceSection
+
+                if shouldShowTextPanel {
+                    textSection
+                }
+
+                if shouldShowBlurPanel {
+                    blurSection
+                }
 
                 if shouldShowColourPickerPanel {
                     colourPickerSection
@@ -989,7 +1517,7 @@ private struct InspectorSidebar: View {
         case .calibrate:
             return "Draw over a known distance, then enter its real-world length and unit."
         case .angle:
-            return "Drag the baseline from its first point to the vertex. Release, then drag from the vertex to define the measured arm. The 90° reference and deviation update live."
+            return "Drag the baseline. MeasureShot creates a 90° arm automatically. Then drag a third line from the end of that arm; the displayed value is its signed angular difference from the original baseline."
         case .arrow:
             return "Drag from the arrow tail to its tip."
         case .rectangle:
@@ -999,7 +1527,7 @@ private struct InspectorSidebar: View {
         case .text:
             return "Click the image where you want to place text."
         case .blur:
-            return "Drag across the area you want to obscure."
+            return "Drag over the image to paint blur in real time. Adjust brush size and strength in the inspector."
         case .colourPicker:
             return "Move over the image and click to copy the sampled colour value."
         }
@@ -1048,3 +1576,4 @@ private struct InspectorSidebar: View {
     EditorView()
         .environment(AppState())
 }
+

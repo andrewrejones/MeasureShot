@@ -59,9 +59,16 @@ final class AppState {
     var sampledHex: String = "#000000"
     var sampledRGB: String = "0, 0, 0"
 
+    var defaultText = "Double-click to edit"
+    var defaultFontSize: CGFloat = 18
+    var defaultBlurRadius: Double = 12
+    var defaultBlurBrushSize: Double = 44
+    var showBlurMask = false
+
     private var angleCreationStage = 0
     private var angleFirstPoint: CGPoint?
     private var angleVertex: CGPoint?
+    private var anglePerpendicularEnd: CGPoint?
 
     private var undoStack: [[MSAnnotation]] = []
     private var redoStack: [[MSAnnotation]] = []
@@ -125,13 +132,22 @@ final class AppState {
             return .calibration
         case .angle:
             return .angle
-        case .select, .text, .blur, .colourPicker:
+        case .text:
+            return .text
+        case .blur:
+            return .blur
+        case .select, .colourPicker:
             return nil
         }
     }
 
     func canDrawWithSelectedTool() -> Bool {
-        annotationType(for: selectedTool) != nil
+        switch selectedTool {
+        case .measure, .calibrate, .angle, .arrow, .rectangle, .ellipse, .blur:
+            return true
+        case .select, .text, .colourPicker:
+            return false
+        }
     }
 
     func beginAnnotation(type: MSAnnotationType, at point: CGPoint) {
@@ -139,15 +155,44 @@ final class AppState {
             if angleCreationStage == 0 {
                 angleFirstPoint = point
                 angleVertex = nil
+                anglePerpendicularEnd = nil
                 angleCreationStage = 1
 
                 var annotation = MSAnnotation(type: .angle, start: point, end: point)
                 annotation.stroke.color = colorData(from: annotationColor)
                 annotation.stroke.lineWidth = annotationLineWidth
                 inProgressAnnotation = annotation
-                statusMessage = "Draw the baseline to the vertex"
+                statusMessage = "Draw the baseline"
                 return
             }
+
+            if angleCreationStage == 2 {
+                statusMessage = "Draw the measured line from the end of the 90° arm"
+                return
+            }
+        }
+
+        if type == .text {
+            recordUndoState()
+            var annotation = MSAnnotation(type: .text, start: point, end: point)
+            annotation.text = defaultText
+            annotation.fontSize = defaultFontSize
+            annotation.stroke.color = colorData(from: annotationColor)
+            annotations.append(annotation)
+            selectedAnnotationID = annotation.id
+            statusMessage = "Added text"
+            return
+        }
+
+        if type == .blur {
+            var annotation = MSAnnotation(type: .blur, start: point, end: point)
+            annotation.blurRadius = defaultBlurRadius
+            annotation.blurBrushSize = defaultBlurBrushSize
+            annotation.points = [point]
+            annotation.stroke.color = colorData(from: annotationColor)
+            inProgressAnnotation = annotation
+            statusMessage = "Painting blur"
+            return
         }
 
         var annotation = MSAnnotation(type: type, start: point, end: point)
@@ -163,7 +208,18 @@ final class AppState {
             if angleCreationStage == 1 {
                 annotation.end = point
             } else if angleCreationStage == 2 {
-                annotation.thirdPoint = point
+                annotation.fourthPoint = point
+            }
+        } else if annotation.type == .blur {
+            annotation.end = point
+
+            if let lastPoint = annotation.points.last {
+                let distance = hypot(point.x - lastPoint.x, point.y - lastPoint.y)
+                if distance >= max(2, annotation.blurBrushSize * 0.12) {
+                    annotation.points.append(point)
+                }
+            } else {
+                annotation.points = [point]
             }
         } else {
             annotation.end = point
@@ -175,24 +231,59 @@ final class AppState {
     func finishAnnotation() {
         guard var annotation = inProgressAnnotation else { return }
 
+        if annotation.type == .blur {
+            guard !annotation.points.isEmpty else {
+                inProgressAnnotation = nil
+                return
+            }
+
+            if annotation.points.count == 1 {
+                annotation.points.append(annotation.points[0])
+            }
+
+            recordUndoState()
+            annotations.append(annotation)
+            selectedAnnotationID = annotation.id
+            inProgressAnnotation = nil
+            statusMessage = "Added blur stroke"
+            return
+        }
+
         if annotation.type == .angle {
             if angleCreationStage == 1 {
                 guard annotation.length >= 2 else {
                     resetAngleCreation()
+                    statusMessage = "Angle cancelled"
                     return
                 }
 
                 angleVertex = annotation.end
-                annotation.thirdPoint = annotation.end
+                let perpendicularLength = max(annotation.length * 0.6, 40)
+
+                guard let perpendicularEnd = annotation.perpendicularPoint(
+                    length: perpendicularLength
+                ) else {
+                    resetAngleCreation()
+                    return
+                }
+
+                anglePerpendicularEnd = perpendicularEnd
+                annotation.thirdPoint = perpendicularEnd
+                annotation.fourthPoint = perpendicularEnd
                 inProgressAnnotation = annotation
                 angleCreationStage = 2
-                statusMessage = "Drag from the vertex to create the measured arm"
+                statusMessage = "Now drag from the end of the 90° arm to define the measured line"
                 return
             }
 
             if angleCreationStage == 2 {
-                guard let third = annotation.thirdPoint,
-                      hypot(third.x - annotation.end.x, third.y - annotation.end.y) >= 2 else {
+                guard let thirdPoint = annotation.thirdPoint,
+                      let fourthPoint = annotation.fourthPoint,
+                      hypot(
+                          fourthPoint.x - thirdPoint.x,
+                          fourthPoint.y - thirdPoint.y
+                      ) >= 2 else {
+                    statusMessage = "Draw the measured line"
                     return
                 }
 
@@ -200,7 +291,7 @@ final class AppState {
                 annotations.append(annotation)
                 selectedAnnotationID = annotation.id
                 resetAngleCreation()
-                statusMessage = "Added angle"
+                statusMessage = "Added three-line angle"
                 return
             }
         }
@@ -235,6 +326,7 @@ final class AppState {
         angleCreationStage = 0
         angleFirstPoint = nil
         angleVertex = nil
+        anglePerpendicularEnd = nil
         inProgressAnnotation = nil
     }
 
@@ -383,6 +475,42 @@ final class AppState {
         statusMessage = "Updated annotation style"
     }
 
+    func updateSelectedText(_ text: String) {
+        guard let id = selectedAnnotationID,
+              let index = annotations.firstIndex(where: { $0.id == id }),
+              annotations[index].type == .text else { return }
+
+        recordUndoState()
+        annotations[index].text = text
+    }
+
+    func updateSelectedFontSize(_ size: CGFloat) {
+        guard let id = selectedAnnotationID,
+              let index = annotations.firstIndex(where: { $0.id == id }),
+              annotations[index].type == .text else { return }
+
+        recordUndoState()
+        annotations[index].fontSize = size
+    }
+
+    func updateSelectedBlurRadius(_ radius: Double) {
+        guard let id = selectedAnnotationID,
+              let index = annotations.firstIndex(where: { $0.id == id }),
+              annotations[index].type == .blur else { return }
+
+        recordUndoState()
+        annotations[index].blurRadius = radius
+    }
+
+    func updateSelectedBlurBrushSize(_ size: Double) {
+        guard let id = selectedAnnotationID,
+              let index = annotations.firstIndex(where: { $0.id == id }),
+              annotations[index].type == .blur else { return }
+
+        recordUndoState()
+        annotations[index].blurBrushSize = size
+    }
+
     private func recordUndoState() {
         undoStack.append(annotations)
         redoStack.removeAll()
@@ -417,6 +545,16 @@ final class AppState {
            annotations[index].thirdPoint != nil {
             annotations[index].thirdPoint!.x += delta.width
             annotations[index].thirdPoint!.y += delta.height
+        }
+        if annotations[index].type == .angle,
+           annotations[index].fourthPoint != nil {
+            annotations[index].fourthPoint!.x += delta.width
+            annotations[index].fourthPoint!.y += delta.height
+        }
+        if annotations[index].type == .blur {
+            annotations[index].points = annotations[index].points.map {
+                CGPoint(x: $0.x + delta.width, y: $0.y + delta.height)
+            }
         }
     }
 
@@ -463,6 +601,20 @@ final class AppState {
         }
 
         annotations[index].thirdPoint = point
+    }
+
+    func updateSelectedAngleFourthPoint(to point: CGPoint) {
+        guard let selectedAnnotationID,
+              let index = annotations.firstIndex(where: { $0.id == selectedAnnotationID }),
+              annotations[index].type == .angle else {
+            return
+        }
+
+        if lastEndpointEditUndoState == nil {
+            lastEndpointEditUndoState = annotations
+        }
+
+        annotations[index].fourthPoint = point
     }
 
     func finishEditingSelectedAnnotationEndpoint() {

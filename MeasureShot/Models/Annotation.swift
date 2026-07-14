@@ -115,12 +115,18 @@ struct MSAnnotation: Identifiable, Codable, Sendable {
     var type: MSAnnotationType
     var start: CGPoint
     var end: CGPoint
+    
     var thirdPoint: CGPoint?
+    var fourthPoint: CGPoint?
     var stroke: MSStrokeStyle = MSStrokeStyle()
     var text: String = ""
+    var fontSize: CGFloat = 18
     var measuredValue: Double?
     var measurementUnit: MSMeasurementUnit = .pixels
     var referenceAngleDegrees: Double = 90
+    var blurRadius: Double = 12
+    var blurBrushSize: Double = 44
+    var points: [CGPoint] = []
 
     init(
         type: MSAnnotationType,
@@ -132,6 +138,7 @@ struct MSAnnotation: Identifiable, Codable, Sendable {
         self.start = start
         self.end = end
         self.thirdPoint = nil
+        self.fourthPoint = nil
     }
 
     var width: CGFloat {
@@ -188,10 +195,8 @@ struct MSAnnotation: Identifiable, Codable, Sendable {
 
         if type == .angle {
             return String(
-                format: "%.1f°  (%+.1f° from %.0f°)",
-                angleDegrees,
-                angleDeviationFromReference,
-                referenceAngleDegrees
+                format: "%+.1f° from baseline",
+                angleDeviationFromReference
             )
         }
 
@@ -199,58 +204,53 @@ struct MSAnnotation: Identifiable, Codable, Sendable {
     }
 
     var angleDegrees: Double {
-        guard let thirdPoint else {
-            let radians = atan2(end.y - start.y, end.x - start.x)
-            var degrees = Double(radians * 180 / .pi)
-
-            while degrees < 0 { degrees += 360 }
-            while degrees >= 360 { degrees -= 360 }
-
-            return degrees
+        guard let thirdPoint,
+              let fourthPoint else {
+            return 0
         }
 
         let baseline = CGPoint(
-            x: start.x - end.x,
-            y: start.y - end.y
+            x: end.x - start.x,
+            y: end.y - start.y
         )
-        let measuredArm = CGPoint(
-            x: thirdPoint.x - end.x,
-            y: thirdPoint.y - end.y
+        let measuredLine = CGPoint(
+            x: fourthPoint.x - thirdPoint.x,
+            y: fourthPoint.y - thirdPoint.y
         )
 
         let baselineLength = hypot(baseline.x, baseline.y)
-        let measuredLength = hypot(measuredArm.x, measuredArm.y)
+        let measuredLength = hypot(measuredLine.x, measuredLine.y)
 
         guard baselineLength > 0, measuredLength > 0 else { return 0 }
 
-        let dot = baseline.x * measuredArm.x + baseline.y * measuredArm.y
+        let dot = baseline.x * measuredLine.x + baseline.y * measuredLine.y
         let cosine = min(1, max(-1, dot / (baselineLength * measuredLength)))
+        let unsigned = acos(cosine) * 180 / .pi
+        let cross = baseline.x * measuredLine.y - baseline.y * measuredLine.x
 
-        return acos(cosine) * 180 / .pi
+        return cross < 0 ? -unsigned : unsigned
     }
 
     var angleDeviationFromReference: Double {
-        angleDegrees - referenceAngleDegrees
+        angleDegrees
     }
 
     var perpendicularReferencePoint: CGPoint? {
-        guard let thirdPoint else { return nil }
+        thirdPoint
+    }
 
-        let baselineVector = CGPoint(
-            x: start.x - end.x,
-            y: start.y - end.y
+    func perpendicularPoint(length: CGFloat) -> CGPoint? {
+        let baseline = CGPoint(
+            x: end.x - start.x,
+            y: end.y - start.y
         )
-        let baselineLength = hypot(baselineVector.x, baselineVector.y)
+        let baselineLength = hypot(baseline.x, baseline.y)
 
         guard baselineLength > 0 else { return nil }
 
-        let armLength = max(
-            hypot(thirdPoint.x - end.x, thirdPoint.y - end.y),
-            baselineLength * 0.5
-        )
         let unit = CGPoint(
-            x: baselineVector.x / baselineLength,
-            y: baselineVector.y / baselineLength
+            x: baseline.x / baselineLength,
+            y: baseline.y / baselineLength
         )
         let radians = referenceAngleDegrees * .pi / 180
         let rotated = CGPoint(
@@ -259,8 +259,8 @@ struct MSAnnotation: Identifiable, Codable, Sendable {
         )
 
         return CGPoint(
-            x: end.x + rotated.x * armLength,
-            y: end.y + rotated.y * armLength
+            x: end.x + rotated.x * length,
+            y: end.y + rotated.y * length
         )
     }
 }

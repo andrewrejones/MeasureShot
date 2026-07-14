@@ -1,4 +1,5 @@
 import AppKit
+import CoreImage
 
 @MainActor
 enum ExportRenderer {
@@ -22,6 +23,13 @@ enum ExportRenderer {
             from: NSRect(origin: .zero, size: image.size),
             operation: .copy,
             fraction: 1
+        )
+
+        drawBlurRegions(
+            from: image,
+            annotations: annotations.filter { $0.type == .blur },
+            imageSize: size,
+            enabled: showAnnotations
         )
 
         guard let context = NSGraphicsContext.current?.cgContext else {
@@ -59,8 +67,11 @@ enum ExportRenderer {
         case .measurement, .calibration, .angle:
             return showMeasurements
 
-        case .line, .arrow, .rectangle, .ellipse, .text, .blur:
+        case .line, .arrow, .rectangle, .ellipse, .text:
             return showAnnotations
+
+        case .blur:
+            return false
         }
     }
 
@@ -125,12 +136,126 @@ enum ExportRenderer {
                 in: context
             )
 
-        case .text, .blur:
+        case .text:
+            drawText(
+                annotation,
+                imageHeight: imageHeight,
+                in: context
+            )
+
+        case .blur:
             break
         }
+        context.restoreGState()
+    }
+
+    private static func drawText(
+        _ annotation: MSAnnotation,
+        imageHeight: CGFloat,
+        in context: CGContext
+    ) {
+        context.saveGState()
+        context.translateBy(x: 0, y: imageHeight)
+        context.scaleBy(x: 1, y: -1)
+
+        let colour = annotation.stroke.color
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: annotation.fontSize),
+            .foregroundColor: NSColor(
+                red: colour.red,
+                green: colour.green,
+                blue: colour.blue,
+                alpha: colour.alpha * annotation.stroke.opacity
+            )
+        ]
+
+        let attributedString = NSAttributedString(
+            string: annotation.text,
+            attributes: attributes
+        )
+
+        attributedString.draw(
+            at: CGPoint(
+                x: annotation.start.x,
+                y: imageHeight - annotation.start.y - annotation.fontSize
+            )
+        )
 
         context.restoreGState()
     }
+
+    private static func drawBlurRegions(
+        from image: NSImage,
+        annotations: [MSAnnotation],
+        imageSize: CGSize,
+        enabled: Bool
+    ) {
+        guard enabled,
+              !annotations.isEmpty,
+              let tiffData = image.tiffRepresentation,
+              let ciImage = CIImage(data: tiffData) else {
+            return
+        }
+
+        let ciContext = CIContext(options: nil)
+
+        for annotation in annotations {
+            guard !annotation.points.isEmpty else { continue }
+
+            guard let filter = CIFilter(name: "CIGaussianBlur") else { continue }
+            filter.setValue(ciImage, forKey: kCIInputImageKey)
+            filter.setValue(annotation.blurRadius, forKey: kCIInputRadiusKey)
+
+            guard let outputImage = filter.outputImage?.cropped(to: ciImage.extent),
+                  let cgImage = ciContext.createCGImage(outputImage, from: ciImage.extent) else {
+                continue
+            }
+
+            let blurredImage = NSImage(cgImage: cgImage, size: imageSize)
+
+            let maskImage = NSImage(size: imageSize)
+            maskImage.lockFocus()
+            NSColor.white.setFill()
+
+            let diameter = annotation.blurBrushSize
+            let radius = diameter / 2
+
+            for point in annotation.points {
+                let appKitPoint = CGPoint(
+                    x: point.x,
+                    y: imageSize.height - point.y
+                )
+
+                NSBezierPath(
+                    ovalIn: NSRect(
+                        x: appKitPoint.x - radius,
+                        y: appKitPoint.y - radius,
+                        width: diameter,
+                        height: diameter
+                    )
+                ).fill()
+            }
+
+            maskImage.unlockFocus()
+
+            NSGraphicsContext.saveGraphicsState()
+            maskImage.draw(
+                in: NSRect(origin: .zero, size: imageSize),
+                from: NSRect(origin: .zero, size: imageSize),
+                operation: .destinationIn,
+                fraction: 1
+            )
+
+            blurredImage.draw(
+                in: NSRect(origin: .zero, size: imageSize),
+                from: NSRect(origin: .zero, size: imageSize),
+                operation: .sourceOver,
+                fraction: 1
+            )
+            NSGraphicsContext.restoreGraphicsState()
+        }
+    }
+
 
     private static func drawLine(
         from start: CGPoint,
@@ -180,26 +305,31 @@ enum ExportRenderer {
         drawLine(from: annotation.start, to: annotation.end, in: context)
 
         if let thirdPoint = annotation.thirdPoint {
-            drawLine(from: annotation.end, to: thirdPoint, in: context)
-        }
-
-        if let referencePoint = annotation.perpendicularReferencePoint {
             context.saveGState()
             context.setLineDash(phase: 0, lengths: [6, 4])
-            drawLine(from: annotation.end, to: referencePoint, in: context)
+            drawLine(from: annotation.end, to: thirdPoint, in: context)
             context.restoreGState()
         }
 
-        let label = annotation.displayValue(
-            calibration: calibration,
-            outputUnit: outputUnit
-        )
-        drawLabel(
-            label,
-            at: CGPoint(x: annotation.end.x + 12, y: annotation.end.y - 18),
-            imageHeight: imageHeight,
-            in: context
-        )
+        if let thirdPoint = annotation.thirdPoint,
+           let fourthPoint = annotation.fourthPoint {
+            drawLine(from: thirdPoint, to: fourthPoint, in: context)
+
+            let label = annotation.displayValue(
+                calibration: calibration,
+                outputUnit: outputUnit
+            )
+
+            drawLabel(
+                label,
+                at: CGPoint(
+                    x: thirdPoint.x + 12,
+                    y: thirdPoint.y - 18
+                ),
+                imageHeight: imageHeight,
+                in: context
+            )
+        }
     }
 
     private static func drawLabel(
