@@ -11,6 +11,7 @@ enum MSToolType: String, CaseIterable, Identifiable, Sendable {
     case ellipse
     case text
     case blur
+    case crop
     case colourPicker
 
     var id: String { rawValue }
@@ -26,6 +27,7 @@ enum MSToolType: String, CaseIterable, Identifiable, Sendable {
         case .ellipse: "Ellipse"
         case .text: "Text"
         case .blur: "Blur"
+        case .crop: "Crop"
         case .colourPicker: "Colour Picker"
         }
     }
@@ -41,6 +43,7 @@ enum MSToolType: String, CaseIterable, Identifiable, Sendable {
         case .ellipse: "circle"
         case .text: "textformat"
         case .blur: "drop"
+        case .crop: "crop"
         case .colourPicker: "eyedropper"
         }
     }

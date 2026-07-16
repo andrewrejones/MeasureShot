@@ -27,10 +27,54 @@ enum MSCanvasLayer: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
+private struct ImageDocumentEditState {
+    var rotationQuarterTurns: Int
+    var freeRotationDegrees: Double
+    var isFlippedHorizontally: Bool
+    var isFlippedVertically: Bool
+    var cropRect: CGRect?
+    var brightness: Double
+    var contrast: Double
+    var exposure: Double
+
+    init(document: ImageDocument) {
+        rotationQuarterTurns = document.rotationQuarterTurns
+        freeRotationDegrees = document.freeRotationDegrees
+        isFlippedHorizontally = document.isFlippedHorizontally
+        isFlippedVertically = document.isFlippedVertically
+        cropRect = document.cropRect
+        brightness = document.brightness
+        contrast = document.contrast
+        exposure = document.exposure
+    }
+
+    func apply(to document: ImageDocument) {
+        document.rotationQuarterTurns = rotationQuarterTurns
+        document.freeRotationDegrees = freeRotationDegrees
+        document.isFlippedHorizontally = isFlippedHorizontally
+        document.isFlippedVertically = isFlippedVertically
+        document.cropRect = cropRect
+        document.brightness = brightness
+        document.contrast = contrast
+        document.exposure = exposure
+    }
+}
+
+private struct AppUndoState {
+    var annotations: [MSAnnotation]
+    var imageDocumentState: ImageDocumentEditState?
+}
+
 @MainActor
 @Observable
 final class AppState {
-    var currentImage: NSImage?
+    var imageDocument: ImageDocument?
+
+    var currentImage: NSImage? {
+        guard let imageDocument else { return nil }
+        return ImageRenderer.render(document: imageDocument)
+    }
+
     var selectedTool: MSToolType = .select
     var statusMessage = "Ready"
     var isCapturing = false
@@ -42,6 +86,7 @@ final class AppState {
     var isGuideLayerVisible = true
 
     var activeLayer: MSCanvasLayer = .annotations
+    var exportHistory: [MSExportHistoryItem] = []
 
     // MARK: - Canvas State
 
@@ -64,14 +109,16 @@ final class AppState {
     var defaultBlurRadius: Double = 12
     var defaultBlurBrushSize: Double = 44
     var showBlurMask = false
+    var cropSelectionRect: CGRect?
 
     private var angleCreationStage = 0
     private var angleFirstPoint: CGPoint?
     private var angleVertex: CGPoint?
     private var anglePerpendicularEnd: CGPoint?
 
-    private var undoStack: [[MSAnnotation]] = []
-    private var redoStack: [[MSAnnotation]] = []
+    private var undoStack: [AppUndoState] = []
+    private var redoStack: [AppUndoState] = []
+    private var pendingImageAdjustmentUndoState: AppUndoState?
 
     func startCapture() {
         guard !isCapturing else { return }
@@ -86,17 +133,8 @@ final class AppState {
 
             switch result {
             case .success(let image):
-                self.currentImage = image
-                self.annotations.removeAll()
-                self.selectedAnnotationID = nil
-                self.inProgressAnnotation = nil
-                self.undoStack.removeAll()
-                self.redoStack.removeAll()
-                self.calibration = nil
-                self.outputMeasurementUnit = .millimetres
-                self.zoomScale = 1
-                self.isFitToWindow = true
-                self.selectedTool = .select
+                self.imageDocument = ImageDocument(image: image, title: "Screenshot")
+                self.resetCanvasStateForNewDocument()
                 self.statusMessage = "Capture complete"
                 self.showEditor()
 
@@ -109,6 +147,217 @@ final class AppState {
                 self.showEditor()
             }
         }
+    }
+
+    func clearImage() {
+        guard imageDocument != nil else { return }
+
+        imageDocument = nil
+        resetCanvasStateForNewDocument()
+        sampledColor = .clear
+        sampledHex = "#000000"
+        sampledRGB = "0, 0, 0"
+        statusMessage = "Cleared image"
+    }
+
+    func rotateImageClockwise() {
+        guard let imageDocument,
+              let imageSize = currentImage?.size else {
+            statusMessage = "No image to rotate"
+            return
+        }
+
+        recordUndoState()
+        imageDocument.rotateClockwise()
+        transformAnnotations { rotatedClockwise($0, in: imageSize) }
+        resetTransientImageEditState()
+        refreshCalibrationFromAnnotations()
+        isFitToWindow = true
+        statusMessage = "Rotated 90° clockwise"
+    }
+
+    func flipImageHorizontally() {
+        guard let imageDocument,
+              let imageSize = currentImage?.size else {
+            statusMessage = "No image to flip"
+            return
+        }
+
+        recordUndoState()
+        imageDocument.flipHorizontally()
+        transformAnnotations { flippedHorizontally($0, in: imageSize) }
+        resetTransientImageEditState()
+        refreshCalibrationFromAnnotations()
+        statusMessage = "Flipped horizontally"
+    }
+
+    func flipImageVertically() {
+        guard let imageDocument,
+              let imageSize = currentImage?.size else {
+            statusMessage = "No image to flip"
+            return
+        }
+
+        recordUndoState()
+        imageDocument.flipVertically()
+        transformAnnotations { flippedVertically($0, in: imageSize) }
+        resetTransientImageEditState()
+        refreshCalibrationFromAnnotations()
+        statusMessage = "Flipped vertically"
+    }
+
+    func setFreeRotationDegrees(_ degrees: Double) {
+        guard let imageDocument,
+              let imageSize = currentImage?.size else {
+            statusMessage = "No image to rotate"
+            return
+        }
+
+        let delta = degrees - imageDocument.freeRotationDegrees
+        guard abs(delta) >= 0.0001 else { return }
+
+        recordUndoState()
+        imageDocument.freeRotationDegrees = degrees
+        transformAnnotations { rotated($0, in: imageSize, clockwiseDegrees: delta) }
+        resetTransientImageEditState()
+        refreshCalibrationFromAnnotations()
+        isFitToWindow = true
+        statusMessage = String(format: "Rotated %.0f°", degrees)
+    }
+
+    func resetImageRotation() {
+        guard let imageDocument,
+              let imageSize = currentImage?.size else {
+            statusMessage = "No image to reset"
+            return
+        }
+
+        let totalRotation = imageDocument.totalRotationDegrees
+        guard abs(totalRotation.truncatingRemainder(dividingBy: 360)) >= 0.0001 else { return }
+
+        recordUndoState()
+        imageDocument.rotationQuarterTurns = 0
+        imageDocument.freeRotationDegrees = 0
+        transformAnnotations { rotated($0, in: imageSize, clockwiseDegrees: -totalRotation) }
+        resetTransientImageEditState()
+        refreshCalibrationFromAnnotations()
+        isFitToWindow = true
+        statusMessage = "Reset rotation"
+    }
+
+    func selectCropTool() {
+        guard let currentImage else {
+            statusMessage = "No image to crop"
+            return
+        }
+
+        selectedTool = .crop
+        cancelAnnotation()
+        resetAngleCreation()
+        cropSelectionRect = CGRect(origin: .zero, size: currentImage.size)
+        statusMessage = "Drag crop edges, corners, or draw a new crop box"
+    }
+
+    func updateCropSelection(_ rect: CGRect, imageSize: CGSize) {
+        cropSelectionRect = clampedCropRect(rect, imageSize: imageSize)
+    }
+
+    func applyCropSelection(imageSize: CGSize) {
+        guard let imageDocument,
+              let cropSelectionRect else {
+            return
+        }
+
+        let cropRect = clampedCropRect(cropSelectionRect, imageSize: imageSize)
+        guard cropRect.width >= 4, cropRect.height >= 4 else {
+            self.cropSelectionRect = CGRect(origin: .zero, size: imageSize)
+            statusMessage = "Crop area is too small"
+            return
+        }
+
+        recordUndoState()
+        let existingCrop = imageDocument.cropRect ?? CGRect(origin: .zero, size: imageSize)
+        imageDocument.cropRect = CGRect(
+            x: existingCrop.minX + cropRect.minX,
+            y: existingCrop.minY + cropRect.minY,
+            width: cropRect.width,
+            height: cropRect.height
+        )
+
+        transformAnnotations { point in
+            CGPoint(x: point.x - cropRect.minX, y: point.y - cropRect.minY)
+        }
+        selectedAnnotationID = nil
+        self.cropSelectionRect = nil
+        resetTransientImageEditState()
+        refreshCalibrationFromAnnotations()
+        isFitToWindow = true
+        statusMessage = "Cropped image"
+    }
+
+    func resetImageCrop() {
+        guard let imageDocument,
+              let cropRect = imageDocument.cropRect else {
+            statusMessage = "No crop to reset"
+            return
+        }
+
+        recordUndoState()
+        imageDocument.cropRect = nil
+        transformAnnotations { point in
+            CGPoint(x: point.x + cropRect.minX, y: point.y + cropRect.minY)
+        }
+        selectedAnnotationID = nil
+        cropSelectionRect = nil
+        resetTransientImageEditState()
+        refreshCalibrationFromAnnotations()
+        isFitToWindow = true
+        statusMessage = "Reset crop"
+    }
+
+    func beginImageAdjustmentEdit() {
+        guard imageDocument != nil,
+              pendingImageAdjustmentUndoState == nil else { return }
+        pendingImageAdjustmentUndoState = currentUndoState()
+    }
+
+    func finishImageAdjustmentEdit() {
+        guard let pendingImageAdjustmentUndoState else { return }
+        undoStack.append(pendingImageAdjustmentUndoState)
+        redoStack.removeAll()
+        self.pendingImageAdjustmentUndoState = nil
+    }
+
+    func setImageBrightness(_ brightness: Double) {
+        guard let imageDocument else { return }
+        imageDocument.brightness = brightness
+        statusMessage = String(format: "Brightness %.2f", brightness)
+    }
+
+    func setImageContrast(_ contrast: Double) {
+        guard let imageDocument else { return }
+        imageDocument.contrast = contrast
+        statusMessage = String(format: "Contrast %.2f", contrast)
+    }
+
+    func setImageExposure(_ exposure: Double) {
+        guard let imageDocument else { return }
+        imageDocument.exposure = exposure
+        statusMessage = String(format: "Exposure %+.1f", exposure)
+    }
+
+    func resetImageAdjustments() {
+        guard let imageDocument,
+              imageDocument.brightness != 0 || imageDocument.contrast != 1 || imageDocument.exposure != 0 else {
+            statusMessage = "No image adjustments to reset"
+            return
+        }
+
+        recordUndoState()
+        imageDocument.brightness = 0
+        imageDocument.contrast = 1
+        imageDocument.exposure = 0
+        statusMessage = "Reset image adjustments"
     }
 
     // MARK: - Annotation Management
@@ -136,7 +385,7 @@ final class AppState {
             return .text
         case .blur:
             return .blur
-        case .select, .colourPicker:
+        case .select, .crop, .colourPicker:
             return nil
         }
     }
@@ -145,7 +394,7 @@ final class AppState {
         switch selectedTool {
         case .measure, .calibrate, .angle, .arrow, .rectangle, .ellipse, .blur:
             return true
-        case .select, .text, .colourPicker:
+        case .select, .text, .crop, .colourPicker:
             return false
         }
     }
@@ -445,21 +694,15 @@ final class AppState {
 
     func undo() {
         guard let previous = undoStack.popLast() else { return }
-        redoStack.append(annotations)
-        annotations = previous
-        selectedAnnotationID = nil
-        inProgressAnnotation = nil
-        refreshCalibrationFromAnnotations()
+        redoStack.append(currentUndoState())
+        restore(previous)
         statusMessage = "Undo"
     }
 
     func redo() {
         guard let next = redoStack.popLast() else { return }
-        undoStack.append(annotations)
-        annotations = next
-        selectedAnnotationID = nil
-        inProgressAnnotation = nil
-        refreshCalibrationFromAnnotations()
+        undoStack.append(currentUndoState())
+        restore(next)
         statusMessage = "Redo"
     }
 
@@ -512,8 +755,124 @@ final class AppState {
     }
 
     private func recordUndoState() {
-        undoStack.append(annotations)
+        undoStack.append(currentUndoState())
         redoStack.removeAll()
+    }
+
+    private func currentUndoState() -> AppUndoState {
+        AppUndoState(
+            annotations: annotations,
+            imageDocumentState: imageDocument.map(ImageDocumentEditState.init)
+        )
+    }
+
+    private func restore(_ state: AppUndoState) {
+        annotations = state.annotations
+        if let imageDocument,
+           let imageDocumentState = state.imageDocumentState {
+            imageDocumentState.apply(to: imageDocument)
+        }
+        selectedAnnotationID = nil
+        inProgressAnnotation = nil
+        cropSelectionRect = nil
+        refreshCalibrationFromAnnotations()
+        isFitToWindow = true
+    }
+
+    private func resetCanvasStateForNewDocument() {
+        annotations.removeAll()
+        selectedAnnotationID = nil
+        inProgressAnnotation = nil
+        angleCreationStage = 0
+        angleFirstPoint = nil
+        angleVertex = nil
+        anglePerpendicularEnd = nil
+        cropSelectionRect = nil
+        undoStack.removeAll()
+        redoStack.removeAll()
+        lastMoveUndoState = nil
+        lastEndpointEditUndoState = nil
+        calibration = nil
+        outputMeasurementUnit = .millimetres
+        zoomScale = 1
+        isFitToWindow = true
+        selectedTool = .select
+    }
+
+    private func resetTransientImageEditState() {
+        resetAngleCreation()
+        lastMoveUndoState = nil
+        lastEndpointEditUndoState = nil
+    }
+
+    private func transformAnnotations(_ transformPoint: (CGPoint) -> CGPoint) {
+        annotations = annotations.map { transformed($0, transformPoint: transformPoint) }
+        inProgressAnnotation = inProgressAnnotation.map { transformed($0, transformPoint: transformPoint) }
+    }
+
+    private func transformed(
+        _ annotation: MSAnnotation,
+        transformPoint: (CGPoint) -> CGPoint
+    ) -> MSAnnotation {
+        var transformed = annotation
+        transformed.start = transformPoint(annotation.start)
+        transformed.end = transformPoint(annotation.end)
+        transformed.thirdPoint = annotation.thirdPoint.map(transformPoint)
+        transformed.fourthPoint = annotation.fourthPoint.map(transformPoint)
+        transformed.points = annotation.points.map(transformPoint)
+        return transformed
+    }
+
+    private func clampedCropRect(_ rect: CGRect, imageSize: CGSize) -> CGRect {
+        let bounds = CGRect(origin: .zero, size: imageSize)
+        let standardized = rect.standardized.intersection(bounds)
+
+        guard !standardized.isNull else {
+            return CGRect(origin: .zero, size: imageSize)
+        }
+
+        return standardized
+    }
+
+    private func rotatedClockwise(_ point: CGPoint, in imageSize: CGSize) -> CGPoint {
+        rotated(point, in: imageSize, clockwiseDegrees: 90)
+    }
+
+    private func flippedHorizontally(_ point: CGPoint, in imageSize: CGSize) -> CGPoint {
+        CGPoint(x: imageSize.width - point.x, y: point.y)
+    }
+
+    private func flippedVertically(_ point: CGPoint, in imageSize: CGSize) -> CGPoint {
+        CGPoint(x: point.x, y: imageSize.height - point.y)
+    }
+
+    private func rotated(
+        _ point: CGPoint,
+        in imageSize: CGSize,
+        clockwiseDegrees: Double
+    ) -> CGPoint {
+        let radians = clockwiseDegrees * .pi / 180
+        let cosine = cos(radians)
+        let sine = sin(radians)
+        let outputSize = rotatedBoundingSize(for: imageSize, degrees: clockwiseDegrees)
+        let centeredX = point.x - imageSize.width / 2
+        let centeredY = point.y - imageSize.height / 2
+
+        return CGPoint(
+            x: centeredX * cosine + centeredY * sine + outputSize.width / 2,
+            y: -centeredX * sine + centeredY * cosine + outputSize.height / 2
+        )
+    }
+
+    private func rotatedBoundingSize(for size: CGSize, degrees: Double) -> CGSize {
+        let radians = degrees * .pi / 180
+        let cosine = abs(cos(radians))
+        let sine = abs(sin(radians))
+
+        return CGSize(
+            width: max(1, size.width * cosine + size.height * sine),
+            height: max(1, size.width * sine + size.height * cosine)
+        )
     }
 
     private func colorData(from color: Color) -> ColorData {
@@ -527,15 +886,15 @@ final class AppState {
         )
     }
 
-    private var lastMoveUndoState: [MSAnnotation]?
-    private var lastEndpointEditUndoState: [MSAnnotation]?
+    private var lastMoveUndoState: AppUndoState?
+    private var lastEndpointEditUndoState: AppUndoState?
     func moveSelectedAnnotation(by delta: CGSize) {
         guard let selectedAnnotationID,
               let index = annotations.firstIndex(where: { $0.id == selectedAnnotationID }) else {
             return
         }
         if lastMoveUndoState == nil {
-            lastMoveUndoState = annotations
+            lastMoveUndoState = currentUndoState()
         }
         annotations[index].start.x += delta.width
         annotations[index].start.y += delta.height
@@ -572,7 +931,7 @@ final class AppState {
         }
 
         if lastEndpointEditUndoState == nil {
-            lastEndpointEditUndoState = annotations
+            lastEndpointEditUndoState = currentUndoState()
         }
 
         if isStart {
@@ -597,7 +956,7 @@ final class AppState {
         }
 
         if lastEndpointEditUndoState == nil {
-            lastEndpointEditUndoState = annotations
+            lastEndpointEditUndoState = currentUndoState()
         }
 
         annotations[index].thirdPoint = point
@@ -611,7 +970,7 @@ final class AppState {
         }
 
         if lastEndpointEditUndoState == nil {
-            lastEndpointEditUndoState = annotations
+            lastEndpointEditUndoState = currentUndoState()
         }
 
         annotations[index].fourthPoint = point
@@ -657,6 +1016,7 @@ final class AppState {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.writeObjects([rendered])
+        recordExportHistory(action: .copied, image: rendered)
         statusMessage = "Copied annotated image"
     }
 
@@ -685,6 +1045,7 @@ final class AppState {
 
         do {
             try png.write(to: url)
+            recordExportHistory(action: .saved, image: rendered, fileURL: url)
             statusMessage = "Image saved"
         } catch {
             statusMessage = error.localizedDescription
@@ -716,7 +1077,41 @@ final class AppState {
             of: contentView,
             preferredEdge: .minY
         )
+        recordExportHistory(action: .shared, image: rendered)
     }
+
+    func copyExportHistoryItem(id: UUID) {
+        guard let item = exportHistory.first(where: { $0.id == id }) else { return }
+
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.writeObjects([item.image])
+        statusMessage = "Copied export from history"
+    }
+
+    func clearExportHistory() {
+        guard !exportHistory.isEmpty else { return }
+        exportHistory.removeAll()
+        statusMessage = "Cleared export history"
+    }
+
+    private func recordExportHistory(
+        action: MSExportHistoryAction,
+        image: NSImage,
+        fileURL: URL? = nil
+    ) {
+        exportHistory.insert(
+            MSExportHistoryItem(
+                action: action,
+                image: image,
+                createdAt: Date(),
+                fileURL: fileURL
+            ),
+            at: 0
+        )
+        exportHistory = Array(exportHistory.prefix(20))
+    }
+
     func zoomIn() {
         isFitToWindow = false
         zoomScale = min(zoomScale * 1.25, 8)
