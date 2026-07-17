@@ -65,10 +65,110 @@ private struct AppUndoState {
     var imageDocumentState: ImageDocumentEditState?
 }
 
+struct MSScreenshotTabSummary: Identifiable, Hashable {
+    let id: UUID
+    var title: String
+    var isSelected: Bool
+}
+
+struct MSAverageColor: Hashable {
+    var hex: String
+    var rgb: String
+}
+
+@Observable
+private final class ScreenshotWorkspace: Identifiable {
+    let id: UUID
+    var document: ImageDocument
+    var annotations: [MSAnnotation] = []
+    var selectedAnnotationID: UUID?
+    var inProgressAnnotation: MSAnnotation?
+    var calibration: MSCalibration?
+    var cropSelectionRect: CGRect?
+    var zoomScale: CGFloat = 1
+    var isFitToWindow = true
+    var undoStack: [AppUndoState] = []
+    var redoStack: [AppUndoState] = []
+    var pendingImageAdjustmentUndoState: AppUndoState?
+    var lastMoveUndoState: AppUndoState?
+    var lastEndpointEditUndoState: AppUndoState?
+
+    init(document: ImageDocument) {
+        self.id = document.id
+        self.document = document
+    }
+}
+
 @MainActor
 @Observable
 final class AppState {
-    var imageDocument: ImageDocument?
+    private static let annotationColorDefaultsKey = "annotationColor"
+    private static let annotationLineWidthDefaultsKey = "annotationLineWidth"
+    private static let exportHistoryManifestFilename = "manifest.json"
+    private static let exportHistoryTabDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter
+    }()
+
+    private struct ExportHistoryRecord: Codable {
+        var id: UUID
+        var action: MSExportHistoryAction
+        var createdAt: Date
+        var fileURL: URL?
+        var imageFilename: String
+        var editableSnapshot: ExportHistoryEditableRecord?
+    }
+
+    private struct ExportHistoryEditableRecord: Codable {
+        var documentTitle: String
+        var sourceImageFilename: String
+        var rotationQuarterTurns: Int
+        var freeRotationDegrees: Double
+        var isFlippedHorizontally: Bool
+        var isFlippedVertically: Bool
+        var cropRect: CGRect?
+        var brightness: Double
+        var contrast: Double
+        var exposure: Double
+        var annotations: [MSAnnotation]
+        var calibration: MSCalibration?
+        var outputMeasurementUnit: MSMeasurementUnit
+        var isAnnotationLayerVisible: Bool
+        var isMeasurementLayerVisible: Bool
+        var isGuideLayerVisible: Bool
+    }
+
+    private var screenshotWorkspaces: [ScreenshotWorkspace] = []
+    var selectedScreenshotID: UUID?
+
+    var screenshotTabs: [MSScreenshotTabSummary] {
+        screenshotWorkspaces.map {
+            MSScreenshotTabSummary(
+                id: $0.id,
+                title: $0.document.title,
+                isSelected: $0.id == selectedScreenshotID
+            )
+        }
+    }
+
+    var imageDocument: ImageDocument? {
+        get { selectedWorkspace?.document }
+        set {
+            guard let newValue else {
+                clearImage()
+                return
+            }
+
+            if let index = selectedWorkspaceIndex {
+                screenshotWorkspaces[index].document = newValue
+                selectedScreenshotID = newValue.id
+            } else {
+                addScreenshotWorkspace(for: newValue)
+            }
+        }
+    }
 
     var currentImage: NSImage? {
         guard let imageDocument else { return nil }
@@ -78,8 +178,14 @@ final class AppState {
     var selectedTool: MSToolType = .select
     var statusMessage = "Ready"
     var isCapturing = false
-    var zoomScale: CGFloat = 1
-    var isFitToWindow = true
+    var zoomScale: CGFloat {
+        get { selectedWorkspace?.zoomScale ?? 1 }
+        set { selectedWorkspace?.zoomScale = newValue }
+    }
+    var isFitToWindow: Bool {
+        get { selectedWorkspace?.isFitToWindow ?? true }
+        set { selectedWorkspace?.isFitToWindow = newValue }
+    }
 
     var isAnnotationLayerVisible = true
     var isMeasurementLayerVisible = true
@@ -90,35 +196,82 @@ final class AppState {
 
     // MARK: - Canvas State
 
-    var annotations: [MSAnnotation] = []
-    var selectedAnnotationID: UUID?
-    var inProgressAnnotation: MSAnnotation?
-    var annotationColor: Color = .red
-    var annotationLineWidth: CGFloat = 2
-    var calibration: MSCalibration?
-    var outputMeasurementUnit: MSMeasurementUnit = .millimetres
+    var annotations: [MSAnnotation] {
+        get { selectedWorkspace?.annotations ?? [] }
+        set { selectedWorkspace?.annotations = newValue }
+    }
+    var selectedAnnotationID: UUID? {
+        get { selectedWorkspace?.selectedAnnotationID }
+        set { selectedWorkspace?.selectedAnnotationID = newValue }
+    }
+    var inProgressAnnotation: MSAnnotation? {
+        get { selectedWorkspace?.inProgressAnnotation }
+        set { selectedWorkspace?.inProgressAnnotation = newValue }
+    }
+    var annotationColor: Color = .black {
+        didSet {
+            saveAnnotationColor()
+        }
+    }
+    var annotationLineWidth: CGFloat = 2 {
+        didSet {
+            UserDefaults.standard.set(
+                Double(annotationLineWidth),
+                forKey: Self.annotationLineWidthDefaultsKey
+            )
+        }
+    }
+    var calibration: MSCalibration? {
+        get { selectedWorkspace?.calibration }
+        set { selectedWorkspace?.calibration = newValue }
+    }
+    var outputMeasurementUnit: MSMeasurementUnit = .centimetres
     var calibrationKnownLength: Double = 10
-    var calibrationUnit: MSMeasurementUnit = .millimetres
+    var calibrationUnit: MSMeasurementUnit = .centimetres
 
     var sampledColor: Color = .clear
     var sampledHex: String = "#000000"
     var sampledRGB: String = "0, 0, 0"
+    var latestComparisonResult: String?
 
     var defaultText = "Double-click to edit"
     var defaultFontSize: CGFloat = 18
     var defaultBlurRadius: Double = 12
     var defaultBlurBrushSize: Double = 44
     var showBlurMask = false
-    var cropSelectionRect: CGRect?
+    var defaultPenLineWidth: CGFloat = 7
+    var cropSelectionRect: CGRect? {
+        get { selectedWorkspace?.cropSelectionRect }
+        set { selectedWorkspace?.cropSelectionRect = newValue }
+    }
 
     private var angleCreationStage = 0
     private var angleFirstPoint: CGPoint?
     private var angleVertex: CGPoint?
     private var anglePerpendicularEnd: CGPoint?
 
-    private var undoStack: [AppUndoState] = []
-    private var redoStack: [AppUndoState] = []
-    private var pendingImageAdjustmentUndoState: AppUndoState?
+    private var selectedWorkspaceIndex: Int? {
+        guard let selectedScreenshotID else { return nil }
+        return screenshotWorkspaces.firstIndex { $0.id == selectedScreenshotID }
+    }
+
+    private var selectedWorkspace: ScreenshotWorkspace? {
+        guard let selectedWorkspaceIndex else { return nil }
+        return screenshotWorkspaces[selectedWorkspaceIndex]
+    }
+
+    init() {
+        if let savedColor = Self.loadAnnotationColor() {
+            annotationColor = savedColor.swiftUIColor
+        }
+
+        let savedLineWidth = UserDefaults.standard.double(forKey: Self.annotationLineWidthDefaultsKey)
+        if savedLineWidth > 0 {
+            annotationLineWidth = CGFloat(savedLineWidth)
+        }
+
+        loadExportHistory()
+    }
 
     func startCapture() {
         guard !isCapturing else { return }
@@ -133,8 +286,7 @@ final class AppState {
 
             switch result {
             case .success(let image):
-                self.imageDocument = ImageDocument(image: image, title: "Screenshot")
-                self.resetCanvasStateForNewDocument()
+                self.addScreenshot(image: image)
                 self.statusMessage = "Capture complete"
                 self.showEditor()
 
@@ -150,14 +302,114 @@ final class AppState {
     }
 
     func clearImage() {
-        guard imageDocument != nil else { return }
+        guard let index = selectedWorkspaceIndex else { return }
 
-        imageDocument = nil
-        resetCanvasStateForNewDocument()
+        screenshotWorkspaces.remove(at: index)
+        self.selectedScreenshotID = screenshotWorkspaces.indices.contains(index)
+            ? screenshotWorkspaces[index].id
+            : screenshotWorkspaces.last?.id
+        resetTransientImageEditState()
         sampledColor = .clear
         sampledHex = "#000000"
         sampledRGB = "0, 0, 0"
-        statusMessage = "Cleared image"
+        statusMessage = "Closed screenshot"
+    }
+
+    func addScreenshot(image: NSImage) {
+        let nextNumber = screenshotWorkspaces.count + 1
+        let document = ImageDocument(image: image, title: "Screenshot \(nextNumber)")
+        addScreenshotWorkspace(for: document)
+        resetCanvasStateForNewDocument()
+    }
+
+    func insertImage() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.image]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+
+        let completion: (NSApplication.ModalResponse) -> Void = { [weak self, panel] response in
+            guard response == .OK,
+                  let url = panel.url,
+                  let image = NSImage(contentsOf: url) else {
+                return
+            }
+
+            Task { @MainActor in
+                self?.insertImage(image, title: url.deletingPathExtension().lastPathComponent)
+            }
+        }
+
+        if let window = NSApplication.shared.keyWindow ?? NSApplication.shared.mainWindow {
+            panel.beginSheetModal(for: window, completionHandler: completion)
+        } else {
+            panel.begin(completionHandler: completion)
+        }
+    }
+
+    private func insertImage(_ image: NSImage, title: String) {
+        let document = ImageDocument(image: image, title: title)
+        addScreenshotWorkspace(for: document)
+        resetCanvasStateForNewDocument()
+        statusMessage = "Inserted image"
+        showEditor()
+    }
+
+    func createBlankTab() {
+        let nextNumber = screenshotWorkspaces.count + 1
+        let size = CGSize(width: 1600, height: 1000)
+        let image = NSImage(size: size)
+
+        image.lockFocus()
+        NSColor.white.setFill()
+        NSRect(origin: .zero, size: size).fill()
+        image.unlockFocus()
+
+        let document = ImageDocument(image: image, title: "Blank \(nextNumber)")
+        addScreenshotWorkspace(for: document)
+        resetCanvasStateForNewDocument()
+        statusMessage = "Created blank tab"
+        showEditor()
+    }
+
+    func selectScreenshotTab(id: UUID) {
+        guard screenshotWorkspaces.contains(where: { $0.id == id }) else { return }
+        selectedScreenshotID = id
+        resetTransientImageEditState()
+        selectedTool = .select
+        statusMessage = selectedWorkspace?.document.title ?? "Selected screenshot"
+    }
+
+    func closeScreenshotTab(id: UUID) {
+        guard let index = screenshotWorkspaces.firstIndex(where: { $0.id == id }) else { return }
+        screenshotWorkspaces.remove(at: index)
+
+        if selectedScreenshotID == id {
+            selectedScreenshotID = screenshotWorkspaces.indices.contains(index)
+                ? screenshotWorkspaces[index].id
+                : screenshotWorkspaces.last?.id
+        }
+
+        resetTransientImageEditState()
+        statusMessage = screenshotWorkspaces.isEmpty ? "No screenshots open" : "Closed screenshot"
+    }
+
+    func renameScreenshotTab(id: UUID, title: String) {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let index = screenshotWorkspaces.firstIndex(where: { $0.id == id }) else {
+            return
+        }
+
+        screenshotWorkspaces[index].document.title = title
+        statusMessage = "Renamed tab"
+    }
+
+    private func addScreenshotWorkspace(for document: ImageDocument) {
+        let workspace = ScreenshotWorkspace(document: document)
+        screenshotWorkspaces.append(workspace)
+        selectedScreenshotID = workspace.id
     }
 
     func rotateImageClockwise() {
@@ -316,16 +568,17 @@ final class AppState {
     }
 
     func beginImageAdjustmentEdit() {
-        guard imageDocument != nil,
-              pendingImageAdjustmentUndoState == nil else { return }
-        pendingImageAdjustmentUndoState = currentUndoState()
+        guard let selectedWorkspace,
+              selectedWorkspace.pendingImageAdjustmentUndoState == nil else { return }
+        selectedWorkspace.pendingImageAdjustmentUndoState = currentUndoState()
     }
 
     func finishImageAdjustmentEdit() {
-        guard let pendingImageAdjustmentUndoState else { return }
-        undoStack.append(pendingImageAdjustmentUndoState)
-        redoStack.removeAll()
-        self.pendingImageAdjustmentUndoState = nil
+        guard let selectedWorkspace,
+              let pendingImageAdjustmentUndoState = selectedWorkspace.pendingImageAdjustmentUndoState else { return }
+        selectedWorkspace.undoStack.append(pendingImageAdjustmentUndoState)
+        selectedWorkspace.redoStack.removeAll()
+        selectedWorkspace.pendingImageAdjustmentUndoState = nil
     }
 
     func setImageBrightness(_ brightness: Double) {
@@ -375,12 +628,18 @@ final class AppState {
             return .rectangle
         case .ellipse:
             return .ellipse
+        case .pen:
+            return .pen
+        case .region:
+            return .region
         case .measure:
             return .measurement
         case .calibrate:
             return .calibration
         case .angle:
             return .angle
+        case .parallelAngle:
+            return .parallelAngle
         case .text:
             return .text
         case .blur:
@@ -392,7 +651,7 @@ final class AppState {
 
     func canDrawWithSelectedTool() -> Bool {
         switch selectedTool {
-        case .measure, .calibrate, .angle, .arrow, .rectangle, .ellipse, .blur:
+        case .measure, .calibrate, .angle, .parallelAngle, .arrow, .rectangle, .ellipse, .pen, .region, .blur:
             return true
         case .select, .text, .crop, .colourPicker:
             return false
@@ -403,11 +662,32 @@ final class AppState {
         if type == .angle {
             if angleCreationStage == 0 {
                 angleFirstPoint = point
-                angleVertex = nil
+                angleVertex = point
                 anglePerpendicularEnd = nil
                 angleCreationStage = 1
 
                 var annotation = MSAnnotation(type: .angle, start: point, end: point)
+                annotation.stroke.color = colorData(from: annotationColor)
+                annotation.stroke.lineWidth = annotationLineWidth
+                inProgressAnnotation = annotation
+                statusMessage = "Draw the first angle arm"
+                return
+            }
+
+            if angleCreationStage == 2 {
+                statusMessage = "Draw the second angle arm from the pivot"
+                return
+            }
+        }
+
+        if type == .parallelAngle {
+            if angleCreationStage == 0 {
+                angleFirstPoint = point
+                angleVertex = nil
+                anglePerpendicularEnd = nil
+                angleCreationStage = 1
+
+                var annotation = MSAnnotation(type: .parallelAngle, start: point, end: point)
                 annotation.stroke.color = colorData(from: annotationColor)
                 annotation.stroke.lineWidth = annotationLineWidth
                 inProgressAnnotation = annotation
@@ -444,6 +724,26 @@ final class AppState {
             return
         }
 
+        if type == .pen {
+            var annotation = MSAnnotation(type: .pen, start: point, end: point)
+            annotation.points = [point]
+            annotation.stroke.color = colorData(from: annotationColor)
+            annotation.stroke.lineWidth = max(annotationLineWidth, defaultPenLineWidth)
+            inProgressAnnotation = annotation
+            statusMessage = "Drawing"
+            return
+        }
+
+        if type == .region {
+            var annotation = MSAnnotation(type: .region, start: point, end: point)
+            annotation.points = [point]
+            annotation.stroke.color = colorData(from: annotationColor)
+            annotation.stroke.lineWidth = annotationLineWidth
+            inProgressAnnotation = annotation
+            statusMessage = "Tracing region"
+            return
+        }
+
         var annotation = MSAnnotation(type: type, start: point, end: point)
         annotation.stroke.color = colorData(from: annotationColor)
         annotation.stroke.lineWidth = annotationLineWidth
@@ -457,6 +757,12 @@ final class AppState {
             if angleCreationStage == 1 {
                 annotation.end = point
             } else if angleCreationStage == 2 {
+                annotation.thirdPoint = point
+            }
+        } else if annotation.type == .parallelAngle {
+            if angleCreationStage == 1 {
+                annotation.end = point
+            } else if angleCreationStage == 2 {
                 annotation.fourthPoint = point
             }
         } else if annotation.type == .blur {
@@ -465,6 +771,17 @@ final class AppState {
             if let lastPoint = annotation.points.last {
                 let distance = hypot(point.x - lastPoint.x, point.y - lastPoint.y)
                 if distance >= max(2, annotation.blurBrushSize * 0.12) {
+                    annotation.points.append(point)
+                }
+            } else {
+                annotation.points = [point]
+            }
+        } else if annotation.type == .pen || annotation.type == .region {
+            annotation.end = point
+
+            if let lastPoint = annotation.points.last {
+                let distance = hypot(point.x - lastPoint.x, point.y - lastPoint.y)
+                if distance >= max(1.5, annotation.stroke.lineWidth * 0.35) {
                     annotation.points.append(point)
                 }
             } else {
@@ -498,11 +815,65 @@ final class AppState {
             return
         }
 
+        if annotation.type == .pen || annotation.type == .region {
+            guard !annotation.points.isEmpty else {
+                inProgressAnnotation = nil
+                return
+            }
+
+            if annotation.points.count == 1 {
+                annotation.points.append(annotation.points[0])
+            }
+
+            recordUndoState()
+            annotations.append(annotation)
+            selectedAnnotationID = annotation.id
+            inProgressAnnotation = nil
+            statusMessage = annotation.type == .region ? "Added measured region" : "Added pen stroke"
+            return
+        }
+
         if annotation.type == .angle {
             if angleCreationStage == 1 {
                 guard annotation.length >= 2 else {
                     resetAngleCreation()
                     statusMessage = "Angle cancelled"
+                    return
+                }
+
+                angleVertex = annotation.start
+                annotation.thirdPoint = annotation.start
+                inProgressAnnotation = annotation
+                angleCreationStage = 2
+                statusMessage = "Now drag the second angle arm from the pivot"
+                return
+            }
+
+            if angleCreationStage == 2 {
+                guard let thirdPoint = annotation.thirdPoint,
+                      hypot(
+                          thirdPoint.x - annotation.start.x,
+                          thirdPoint.y - annotation.start.y
+                      ) >= 2 else {
+                    statusMessage = "Draw the second angle arm"
+                    return
+                }
+
+                recordUndoState()
+                annotations.append(annotation)
+                selectedAnnotationID = annotation.id
+                resetAngleCreation()
+                selectedTool = .select
+                statusMessage = "Added angle"
+                return
+            }
+        }
+
+        if annotation.type == .parallelAngle {
+            if angleCreationStage == 1 {
+                guard annotation.length >= 2 else {
+                    resetAngleCreation()
+                    statusMessage = "Parallel angle cancelled"
                     return
                 }
 
@@ -540,7 +911,8 @@ final class AppState {
                 annotations.append(annotation)
                 selectedAnnotationID = annotation.id
                 resetAngleCreation()
-                statusMessage = "Added three-line angle"
+                selectedTool = .select
+                statusMessage = "Added parallel angle"
                 return
             }
         }
@@ -599,16 +971,71 @@ final class AppState {
         statusMessage = "Copied \(sampledHex)"
     }
 
+    func averageColor(for annotation: MSAnnotation) -> MSAverageColor? {
+        guard annotation.isMeasuredRegion,
+              let image = currentImage,
+              let tiff = image.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiff) else {
+            return nil
+        }
+
+        let bounds = annotation.regionBounds.intersection(CGRect(origin: .zero, size: image.size))
+        guard !bounds.isNull, bounds.width > 0, bounds.height > 0 else { return nil }
+
+        let sampleTarget = 10_000.0
+        let sampleStep = max(1, Int(sqrt((bounds.width * bounds.height) / sampleTarget)))
+        var redTotal = 0.0
+        var greenTotal = 0.0
+        var blueTotal = 0.0
+        var sampleCount = 0.0
+
+        var y = Int(bounds.minY)
+        while y < Int(bounds.maxY) {
+            var x = Int(bounds.minX)
+            while x < Int(bounds.maxX) {
+                let point = CGPoint(x: CGFloat(x) + 0.5, y: CGFloat(y) + 0.5)
+
+                if region(annotation, contains: point),
+                   let color = bitmapColor(at: point, imageSize: image.size, bitmap: bitmap) {
+                    redTotal += color.redComponent
+                    greenTotal += color.greenComponent
+                    blueTotal += color.blueComponent
+                    sampleCount += 1
+                }
+
+                x += sampleStep
+            }
+            y += sampleStep
+        }
+
+        guard sampleCount > 0 else { return nil }
+
+        let red = Int((redTotal / sampleCount * 255).rounded())
+        let green = Int((greenTotal / sampleCount * 255).rounded())
+        let blue = Int((blueTotal / sampleCount * 255).rounded())
+
+        return MSAverageColor(
+            hex: String(format: "#%02X%02X%02X", red, green, blue),
+            rgb: "\(red), \(green), \(blue)"
+        )
+    }
+
     func deleteSelectedAnnotation() {
         guard let selectedAnnotationID else { return }
 
+        deleteAnnotation(id: selectedAnnotationID)
+    }
+
+    func deleteAnnotation(id: UUID) {
         let deletingCalibration = annotations.first(where: {
-            $0.id == selectedAnnotationID
+            $0.id == id
         })?.type == .calibration
 
         recordUndoState()
-        annotations.removeAll { $0.id == selectedAnnotationID }
-        self.selectedAnnotationID = nil
+        annotations.removeAll { $0.id == id }
+        if selectedAnnotationID == id {
+            selectedAnnotationID = nil
+        }
 
         if deletingCalibration {
             calibration = nil
@@ -657,6 +1084,47 @@ final class AppState {
         )
     }
 
+    func measuredRegions() -> [MSAnnotation] {
+        annotations.filter { $0.isMeasuredRegion }
+    }
+
+    func regionTitle(for annotation: MSAnnotation) -> String {
+        if let title = annotation.title,
+           !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return title
+        }
+
+        guard annotation.isMeasuredRegion,
+              let index = measuredRegions().firstIndex(where: { $0.id == annotation.id }) else {
+            return ""
+        }
+
+        let title: String
+        switch annotation.type {
+        case .rectangle:
+            title = "Rectangle"
+        case .ellipse:
+            title = "Ellipse"
+        case .region:
+            title = "Region"
+        default:
+            title = "Shape"
+        }
+
+        return "\(title) \(index + 1)"
+    }
+
+    func updateRegionTitle(id: UUID, title: String) {
+        guard let index = annotations.firstIndex(where: { $0.id == id }),
+              annotations[index].isMeasuredRegion else {
+            return
+        }
+
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        annotations[index].title = trimmed.isEmpty ? nil : title
+        statusMessage = "Renamed region"
+    }
+
     private func applyCalibration(from annotation: MSAnnotation) {
         guard annotation.type == .calibration,
               let knownLength = annotation.measuredValue,
@@ -693,15 +1161,17 @@ final class AppState {
     }
 
     func undo() {
-        guard let previous = undoStack.popLast() else { return }
-        redoStack.append(currentUndoState())
+        guard let selectedWorkspace,
+              let previous = selectedWorkspace.undoStack.popLast() else { return }
+        selectedWorkspace.redoStack.append(currentUndoState())
         restore(previous)
         statusMessage = "Undo"
     }
 
     func redo() {
-        guard let next = redoStack.popLast() else { return }
-        undoStack.append(currentUndoState())
+        guard let selectedWorkspace,
+              let next = selectedWorkspace.redoStack.popLast() else { return }
+        selectedWorkspace.undoStack.append(currentUndoState())
         restore(next)
         statusMessage = "Redo"
     }
@@ -716,6 +1186,16 @@ final class AppState {
         annotations[index].stroke.color = colorData(from: annotationColor)
         annotations[index].stroke.lineWidth = annotationLineWidth
         statusMessage = "Updated annotation style"
+    }
+
+    func setAnnotationColor(_ color: Color) {
+        annotationColor = color
+        applyCurrentStyleToSelection()
+    }
+
+    func setAnnotationLineWidth(_ lineWidth: CGFloat) {
+        annotationLineWidth = lineWidth
+        applyCurrentStyleToSelection()
     }
 
     func updateSelectedText(_ text: String) {
@@ -755,8 +1235,9 @@ final class AppState {
     }
 
     private func recordUndoState() {
-        undoStack.append(currentUndoState())
-        redoStack.removeAll()
+        guard let selectedWorkspace else { return }
+        selectedWorkspace.undoStack.append(currentUndoState())
+        selectedWorkspace.redoStack.removeAll()
     }
 
     private func currentUndoState() -> AppUndoState {
@@ -788,12 +1269,13 @@ final class AppState {
         angleVertex = nil
         anglePerpendicularEnd = nil
         cropSelectionRect = nil
-        undoStack.removeAll()
-        redoStack.removeAll()
-        lastMoveUndoState = nil
-        lastEndpointEditUndoState = nil
+        selectedWorkspace?.undoStack.removeAll()
+        selectedWorkspace?.redoStack.removeAll()
+        selectedWorkspace?.pendingImageAdjustmentUndoState = nil
+        selectedWorkspace?.lastMoveUndoState = nil
+        selectedWorkspace?.lastEndpointEditUndoState = nil
         calibration = nil
-        outputMeasurementUnit = .millimetres
+        outputMeasurementUnit = .centimetres
         zoomScale = 1
         isFitToWindow = true
         selectedTool = .select
@@ -801,8 +1283,8 @@ final class AppState {
 
     private func resetTransientImageEditState() {
         resetAngleCreation()
-        lastMoveUndoState = nil
-        lastEndpointEditUndoState = nil
+        selectedWorkspace?.lastMoveUndoState = nil
+        selectedWorkspace?.lastEndpointEditUndoState = nil
     }
 
     private func transformAnnotations(_ transformPoint: (CGPoint) -> CGPoint) {
@@ -886,26 +1368,94 @@ final class AppState {
         )
     }
 
-    private var lastMoveUndoState: AppUndoState?
-    private var lastEndpointEditUndoState: AppUndoState?
+    private func bitmapColor(
+        at point: CGPoint,
+        imageSize: CGSize,
+        bitmap: NSBitmapImageRep
+    ) -> NSColor? {
+        let normalizedX = min(max(point.x / max(imageSize.width, 1), 0), 1)
+        let normalizedY = min(max(point.y / max(imageSize.height, 1), 0), 1)
+        let pixelX = min(max(Int(normalizedX * CGFloat(bitmap.pixelsWide)), 0), bitmap.pixelsWide - 1)
+        let pixelYFromTop = min(max(Int(normalizedY * CGFloat(bitmap.pixelsHigh)), 0), bitmap.pixelsHigh - 1)
+        let pixelY = bitmap.pixelsHigh - 1 - pixelYFromTop
+
+        return bitmap.colorAt(x: pixelX, y: pixelY)?.usingColorSpace(.deviceRGB)
+    }
+
+    private func region(_ annotation: MSAnnotation, contains point: CGPoint) -> Bool {
+        switch annotation.type {
+        case .rectangle:
+            return annotation.normalizedRect.contains(point)
+        case .ellipse:
+            let rect = annotation.normalizedRect
+            guard rect.width > 0, rect.height > 0 else { return false }
+            let normalizedX = (point.x - rect.midX) / (rect.width / 2)
+            let normalizedY = (point.y - rect.midY) / (rect.height / 2)
+            return normalizedX * normalizedX + normalizedY * normalizedY <= 1
+        case .region:
+            return polygon(annotation.points, contains: point)
+        default:
+            return false
+        }
+    }
+
+    private func polygon(_ points: [CGPoint], contains point: CGPoint) -> Bool {
+        guard points.count >= 3 else { return false }
+
+        var isInside = false
+        var previousIndex = points.count - 1
+
+        for currentIndex in points.indices {
+            let current = points[currentIndex]
+            let previous = points[previousIndex]
+            let crossesY = (current.y > point.y) != (previous.y > point.y)
+
+            if crossesY {
+                let intersectionX = (previous.x - current.x) * (point.y - current.y) / (previous.y - current.y) + current.x
+                if point.x < intersectionX {
+                    isInside.toggle()
+                }
+            }
+
+            previousIndex = currentIndex
+        }
+
+        return isInside
+    }
+
+    private func saveAnnotationColor() {
+        let colorData = colorData(from: annotationColor)
+        guard let encoded = try? JSONEncoder().encode(colorData) else { return }
+        UserDefaults.standard.set(encoded, forKey: Self.annotationColorDefaultsKey)
+    }
+
+    private static func loadAnnotationColor() -> ColorData? {
+        guard let data = UserDefaults.standard.data(forKey: annotationColorDefaultsKey) else {
+            return nil
+        }
+
+        return try? JSONDecoder().decode(ColorData.self, from: data)
+    }
+
     func moveSelectedAnnotation(by delta: CGSize) {
-        guard let selectedAnnotationID,
+        guard let selectedWorkspace,
+              let selectedAnnotationID,
               let index = annotations.firstIndex(where: { $0.id == selectedAnnotationID }) else {
             return
         }
-        if lastMoveUndoState == nil {
-            lastMoveUndoState = currentUndoState()
+        if selectedWorkspace.lastMoveUndoState == nil {
+            selectedWorkspace.lastMoveUndoState = currentUndoState()
         }
         annotations[index].start.x += delta.width
         annotations[index].start.y += delta.height
         annotations[index].end.x += delta.width
         annotations[index].end.y += delta.height
-        if annotations[index].type == .angle,
+        if (annotations[index].type == .angle || annotations[index].type == .parallelAngle),
            annotations[index].thirdPoint != nil {
             annotations[index].thirdPoint!.x += delta.width
             annotations[index].thirdPoint!.y += delta.height
         }
-        if annotations[index].type == .angle,
+        if (annotations[index].type == .angle || annotations[index].type == .parallelAngle),
            annotations[index].fourthPoint != nil {
             annotations[index].fourthPoint!.x += delta.width
             annotations[index].fourthPoint!.y += delta.height
@@ -915,23 +1465,30 @@ final class AppState {
                 CGPoint(x: $0.x + delta.width, y: $0.y + delta.height)
             }
         }
+        if annotations[index].type == .pen || annotations[index].type == .region {
+            annotations[index].points = annotations[index].points.map {
+                CGPoint(x: $0.x + delta.width, y: $0.y + delta.height)
+            }
+        }
     }
 
     func finishMovingSelectedAnnotation() {
-        guard let lastMoveUndoState else { return }
-        undoStack.append(lastMoveUndoState)
-        redoStack.removeAll()
-        self.lastMoveUndoState = nil
+        guard let selectedWorkspace,
+              let lastMoveUndoState = selectedWorkspace.lastMoveUndoState else { return }
+        selectedWorkspace.undoStack.append(lastMoveUndoState)
+        selectedWorkspace.redoStack.removeAll()
+        selectedWorkspace.lastMoveUndoState = nil
     }
 
     func updateSelectedAnnotationEndpoint(isStart: Bool, to point: CGPoint) {
-        guard let selectedAnnotationID,
+        guard let selectedWorkspace,
+              let selectedAnnotationID,
               let index = annotations.firstIndex(where: { $0.id == selectedAnnotationID }) else {
             return
         }
 
-        if lastEndpointEditUndoState == nil {
-            lastEndpointEditUndoState = currentUndoState()
+        if selectedWorkspace.lastEndpointEditUndoState == nil {
+            selectedWorkspace.lastEndpointEditUndoState = currentUndoState()
         }
 
         if isStart {
@@ -946,42 +1503,45 @@ final class AppState {
     }
 
     func updateSelectedAngleThirdPoint(to point: CGPoint) {
-        guard let selectedAnnotationID,
+        guard let selectedWorkspace,
+              let selectedAnnotationID,
               let index = annotations.firstIndex(where: { $0.id == selectedAnnotationID }) else {
             return
         }
 
-        guard annotations[index].type == .angle else {
+        guard annotations[index].type == .angle || annotations[index].type == .parallelAngle else {
             return
         }
 
-        if lastEndpointEditUndoState == nil {
-            lastEndpointEditUndoState = currentUndoState()
+        if selectedWorkspace.lastEndpointEditUndoState == nil {
+            selectedWorkspace.lastEndpointEditUndoState = currentUndoState()
         }
 
         annotations[index].thirdPoint = point
     }
 
     func updateSelectedAngleFourthPoint(to point: CGPoint) {
-        guard let selectedAnnotationID,
+        guard let selectedWorkspace,
+              let selectedAnnotationID,
               let index = annotations.firstIndex(where: { $0.id == selectedAnnotationID }),
-              annotations[index].type == .angle else {
+              annotations[index].type == .angle || annotations[index].type == .parallelAngle else {
             return
         }
 
-        if lastEndpointEditUndoState == nil {
-            lastEndpointEditUndoState = currentUndoState()
+        if selectedWorkspace.lastEndpointEditUndoState == nil {
+            selectedWorkspace.lastEndpointEditUndoState = currentUndoState()
         }
 
         annotations[index].fourthPoint = point
     }
 
     func finishEditingSelectedAnnotationEndpoint() {
-        guard let lastEndpointEditUndoState else { return }
+        guard let selectedWorkspace,
+              let lastEndpointEditUndoState = selectedWorkspace.lastEndpointEditUndoState else { return }
 
-        undoStack.append(lastEndpointEditUndoState)
-        redoStack.removeAll()
-        self.lastEndpointEditUndoState = nil
+        selectedWorkspace.undoStack.append(lastEndpointEditUndoState)
+        selectedWorkspace.redoStack.removeAll()
+        selectedWorkspace.lastEndpointEditUndoState = nil
 
         if let selectedAnnotation {
             if selectedAnnotation.type == .calibration {
@@ -1016,7 +1576,7 @@ final class AppState {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.writeObjects([rendered])
-        recordExportHistory(action: .copied, image: rendered)
+        recordExportHistory(action: .copied, image: rendered, editableSnapshot: currentEditableHistorySnapshot())
         statusMessage = "Copied annotated image"
     }
 
@@ -1045,7 +1605,12 @@ final class AppState {
 
         do {
             try png.write(to: url)
-            recordExportHistory(action: .saved, image: rendered, fileURL: url)
+            recordExportHistory(
+                action: .saved,
+                image: rendered,
+                fileURL: url,
+                editableSnapshot: currentEditableHistorySnapshot()
+            )
             statusMessage = "Image saved"
         } catch {
             statusMessage = error.localizedDescription
@@ -1077,7 +1642,47 @@ final class AppState {
             of: contentView,
             preferredEdge: .minY
         )
-        recordExportHistory(action: .shared, image: rendered)
+        recordExportHistory(action: .shared, image: rendered, editableSnapshot: currentEditableHistorySnapshot())
+    }
+
+    func export(option: MSExportOption) {
+        switch option {
+        case .standard:
+            saveImage()
+        case .plain:
+            saveExportImage(renderPlainExportImage(), filename: "MeasureShot Plain.png")
+        case .allOverlays:
+            saveExportImage(
+                renderExportImage(showAnnotations: true, showMeasurements: true),
+                filename: "MeasureShot All Overlays.png"
+            )
+        case .legendOverlay:
+            saveExportImage(renderLegendOverlayExportImage(), filename: "MeasureShot Legend Overlay.png")
+        case .sidebarLegend:
+            saveExportImage(renderSidebarLegendExportImage(), filename: "MeasureShot Sidebar Legend.png")
+        case .annotationsCSV:
+            saveAnnotationsCSV()
+        }
+    }
+
+    func exportPreviewImage(for option: MSExportOption) -> NSImage? {
+        switch option {
+        case .standard:
+            return renderExportImage(
+                showAnnotations: isAnnotationLayerVisible,
+                showMeasurements: isMeasurementLayerVisible
+            )
+        case .plain:
+            return renderPlainExportImage()
+        case .allOverlays:
+            return renderExportImage(showAnnotations: true, showMeasurements: true)
+        case .legendOverlay:
+            return renderLegendOverlayExportImage()
+        case .sidebarLegend:
+            return renderSidebarLegendExportImage()
+        case .annotationsCSV:
+            return nil
+        }
     }
 
     func copyExportHistoryItem(id: UUID) {
@@ -1089,27 +1694,439 @@ final class AppState {
         statusMessage = "Copied export from history"
     }
 
+    func openExportHistoryItem(id: UUID) {
+        guard let item = exportHistory.first(where: { $0.id == id }) else { return }
+
+        if let editableSnapshot = item.editableSnapshot {
+            let document = ImageDocument(
+                image: editableSnapshot.document.originalImage,
+                title: editableSnapshot.document.title
+            )
+            document.rotationQuarterTurns = editableSnapshot.document.rotationQuarterTurns
+            document.freeRotationDegrees = editableSnapshot.document.freeRotationDegrees
+            document.isFlippedHorizontally = editableSnapshot.document.isFlippedHorizontally
+            document.isFlippedVertically = editableSnapshot.document.isFlippedVertically
+            document.cropRect = editableSnapshot.document.cropRect
+            document.brightness = editableSnapshot.document.brightness
+            document.contrast = editableSnapshot.document.contrast
+            document.exposure = editableSnapshot.document.exposure
+
+            addScreenshotWorkspace(for: document)
+            annotations = editableSnapshot.annotations
+            calibration = editableSnapshot.calibration
+            outputMeasurementUnit = editableSnapshot.outputMeasurementUnit
+            isAnnotationLayerVisible = editableSnapshot.isAnnotationLayerVisible
+            isMeasurementLayerVisible = editableSnapshot.isMeasurementLayerVisible
+            isGuideLayerVisible = editableSnapshot.isGuideLayerVisible
+            resetTransientImageEditState()
+            statusMessage = "Opened editable export from history"
+        } else {
+            let document = ImageDocument(
+                image: item.image,
+                title: "History \(Self.exportHistoryTabDateFormatter.string(from: item.createdAt))"
+            )
+            addScreenshotWorkspace(for: document)
+            resetCanvasStateForNewDocument()
+            statusMessage = "Opened flattened export from history"
+        }
+        showEditor()
+    }
+
     func clearExportHistory() {
         guard !exportHistory.isEmpty else { return }
+
+        for item in exportHistory {
+            if let imageFileURL = item.imageFileURL {
+                try? FileManager.default.removeItem(at: imageFileURL)
+            }
+            removeEditableHistorySourceImage(for: item)
+        }
+
         exportHistory.removeAll()
+        saveExportHistoryManifest()
         statusMessage = "Cleared export history"
     }
 
     private func recordExportHistory(
         action: MSExportHistoryAction,
         image: NSImage,
-        fileURL: URL? = nil
+        fileURL: URL? = nil,
+        editableSnapshot: MSExportHistoryEditableSnapshot? = nil
     ) {
+        let id = UUID()
+        let imageFileURL = persistExportHistoryImage(id: id, image: image)
+        let editableSnapshot = persistEditableHistorySnapshot(
+            editableSnapshot,
+            id: id
+        )
+
         exportHistory.insert(
             MSExportHistoryItem(
+                id: id,
                 action: action,
                 image: image,
                 createdAt: Date(),
-                fileURL: fileURL
+                fileURL: fileURL,
+                imageFileURL: imageFileURL,
+                editableSnapshot: editableSnapshot
             ),
             at: 0
         )
-        exportHistory = Array(exportHistory.prefix(20))
+        saveExportHistoryManifest()
+        pruneExportHistory()
+    }
+
+    private func renderPlainExportImage() -> NSImage? {
+        currentImage
+    }
+
+    private func renderExportImage(showAnnotations: Bool, showMeasurements: Bool) -> NSImage? {
+        guard let currentImage else { return nil }
+
+        return ExportRenderer.render(
+            image: currentImage,
+            annotations: annotations,
+            calibration: calibration,
+            outputUnit: outputMeasurementUnit,
+            showAnnotations: showAnnotations,
+            showMeasurements: showMeasurements
+        )
+    }
+
+    private func renderLegendOverlayExportImage() -> NSImage? {
+        guard let currentImage else { return nil }
+
+        return ExportRenderer.renderLegendOverlay(
+            image: currentImage,
+            annotations: annotations,
+            calibration: calibration,
+            outputUnit: outputMeasurementUnit,
+            computationLines: currentComputationExportLines()
+        )
+    }
+
+    private func renderSidebarLegendExportImage() -> NSImage? {
+        guard let currentImage else { return nil }
+
+        return ExportRenderer.renderSidebarLegend(
+            image: currentImage,
+            annotations: annotations,
+            calibration: calibration,
+            outputUnit: outputMeasurementUnit,
+            computationLines: currentComputationExportLines()
+        )
+    }
+
+    private func saveExportImage(_ image: NSImage?, filename: String) {
+        guard let image,
+              let tiff = image.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiff),
+              let png = bitmap.representation(using: .png, properties: [:]) else {
+            statusMessage = "Nothing to export"
+            return
+        }
+
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.png]
+        panel.nameFieldStringValue = filename
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        do {
+            try png.write(to: url)
+            recordExportHistory(
+                action: .saved,
+                image: image,
+                fileURL: url,
+                editableSnapshot: currentEditableHistorySnapshot()
+            )
+            statusMessage = "Export saved"
+        } catch {
+            statusMessage = error.localizedDescription
+        }
+    }
+
+    private func saveAnnotationsCSV() {
+        guard !annotations.isEmpty else {
+            statusMessage = "No annotations to export"
+            return
+        }
+
+        let csv = ExportRenderer.annotationCSV(
+            annotations: annotations,
+            calibration: calibration,
+            outputUnit: outputMeasurementUnit,
+            computationLines: currentComputationExportLines()
+        )
+
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.commaSeparatedText]
+        panel.nameFieldStringValue = "MeasureShot Annotations.csv"
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        do {
+            try csv.write(to: url, atomically: true, encoding: .utf8)
+            statusMessage = "Annotations CSV saved"
+        } catch {
+            statusMessage = error.localizedDescription
+        }
+    }
+
+    func exportHistoryItems(
+        for range: MSExportHistoryRange,
+        selectedDate: Date
+    ) -> [MSExportHistoryItem] {
+        let calendar = Calendar.current
+        let now = Date()
+
+        switch range {
+        case .today:
+            return exportHistory.filter {
+                calendar.isDate($0.createdAt, inSameDayAs: now)
+            }
+        case .yesterday:
+            guard let yesterday = calendar.date(byAdding: .day, value: -1, to: now) else { return [] }
+            return exportHistory.filter {
+                calendar.isDate($0.createdAt, inSameDayAs: yesterday)
+            }
+        case .lastWeek:
+            let startDate = calendar.date(byAdding: .day, value: -7, to: now) ?? now
+            return exportHistory.filter { $0.createdAt >= startDate }
+        case .lastMonth:
+            let startDate = calendar.date(byAdding: .day, value: -30, to: now) ?? now
+            return exportHistory.filter { $0.createdAt >= startDate }
+        case .customDay:
+            return exportHistory.filter {
+                calendar.isDate($0.createdAt, inSameDayAs: selectedDate)
+            }
+        }
+    }
+
+    private func pruneExportHistory() {
+        let cutoffDate = Calendar.current.date(byAdding: .day, value: -30, to: Date()) ?? .distantPast
+        let keptItems = Array(exportHistory.filter { $0.createdAt >= cutoffDate }.prefix(300))
+        let keptIDs = Set(keptItems.map(\.id))
+        let removedItems = exportHistory.filter { !keptIDs.contains($0.id) }
+        exportHistory = keptItems
+
+        for item in removedItems {
+            if let imageFileURL = item.imageFileURL {
+                try? FileManager.default.removeItem(at: imageFileURL)
+            }
+            removeEditableHistorySourceImage(for: item)
+        }
+
+        saveExportHistoryManifest()
+    }
+
+    private func loadExportHistory() {
+        guard let data = try? Data(contentsOf: exportHistoryManifestURL),
+              let records = try? JSONDecoder().decode([ExportHistoryRecord].self, from: data) else {
+            return
+        }
+
+        exportHistory = records.compactMap { record in
+            let imageURL = exportHistoryDirectory.appendingPathComponent(record.imageFilename)
+            guard let image = NSImage(contentsOf: imageURL) else { return nil }
+
+            return MSExportHistoryItem(
+                id: record.id,
+                action: record.action,
+                image: image,
+                createdAt: record.createdAt,
+                fileURL: record.fileURL,
+                imageFileURL: imageURL,
+                editableSnapshot: editableSnapshot(from: record.editableSnapshot)
+            )
+        }
+        .sorted { $0.createdAt > $1.createdAt }
+
+        pruneExportHistory()
+    }
+
+    private func saveExportHistoryManifest() {
+        let records = exportHistory.compactMap { item -> ExportHistoryRecord? in
+            guard let imageFileURL = item.imageFileURL else { return nil }
+            return ExportHistoryRecord(
+                id: item.id,
+                action: item.action,
+                createdAt: item.createdAt,
+                fileURL: item.fileURL,
+                imageFilename: imageFileURL.lastPathComponent,
+                editableSnapshot: editableRecord(from: item.editableSnapshot, id: item.id)
+            )
+        }
+
+        do {
+            try FileManager.default.createDirectory(
+                at: exportHistoryDirectory,
+                withIntermediateDirectories: true
+            )
+            let data = try JSONEncoder().encode(records)
+            try data.write(to: exportHistoryManifestURL, options: .atomic)
+        } catch {
+            statusMessage = "Unable to save history"
+        }
+    }
+
+    private func persistExportHistoryImage(id: UUID, image: NSImage) -> URL? {
+        persistHistoryImage(image, filename: "\(id.uuidString).png")
+    }
+
+    private func persistEditableHistorySnapshot(
+        _ snapshot: MSExportHistoryEditableSnapshot?,
+        id: UUID
+    ) -> MSExportHistoryEditableSnapshot? {
+        guard let snapshot else { return nil }
+        guard persistHistoryImage(
+            snapshot.document.originalImage,
+            filename: sourceImageFilename(for: id)
+        ) != nil else {
+            return nil
+        }
+
+        return snapshot
+    }
+
+    private func persistHistoryImage(_ image: NSImage, filename: String) -> URL? {
+        guard let tiff = image.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiff),
+              let png = bitmap.representation(using: .png, properties: [:]) else {
+            return nil
+        }
+
+        do {
+            try FileManager.default.createDirectory(
+                at: exportHistoryDirectory,
+                withIntermediateDirectories: true
+            )
+            let url = exportHistoryDirectory.appendingPathComponent(filename)
+            try png.write(to: url, options: .atomic)
+            return url
+        } catch {
+            statusMessage = "Unable to save history image"
+            return nil
+        }
+    }
+
+    private func currentEditableHistorySnapshot() -> MSExportHistoryEditableSnapshot? {
+        guard let imageDocument else { return nil }
+
+        let documentSnapshot = MSImageDocumentSnapshot(
+            title: imageDocument.title,
+            originalImage: imageDocument.originalImage,
+            rotationQuarterTurns: imageDocument.rotationQuarterTurns,
+            freeRotationDegrees: imageDocument.freeRotationDegrees,
+            isFlippedHorizontally: imageDocument.isFlippedHorizontally,
+            isFlippedVertically: imageDocument.isFlippedVertically,
+            cropRect: imageDocument.cropRect,
+            brightness: imageDocument.brightness,
+            contrast: imageDocument.contrast,
+            exposure: imageDocument.exposure
+        )
+
+        return MSExportHistoryEditableSnapshot(
+            document: documentSnapshot,
+            annotations: annotations,
+            calibration: calibration,
+            outputMeasurementUnit: outputMeasurementUnit,
+            isAnnotationLayerVisible: isAnnotationLayerVisible,
+            isMeasurementLayerVisible: isMeasurementLayerVisible,
+            isGuideLayerVisible: isGuideLayerVisible
+        )
+    }
+
+    private func currentComputationExportLines() -> [String] {
+        guard let latestComparisonResult,
+              !latestComparisonResult.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return []
+        }
+
+        return [latestComparisonResult]
+    }
+
+    private func editableRecord(
+        from snapshot: MSExportHistoryEditableSnapshot?,
+        id: UUID
+    ) -> ExportHistoryEditableRecord? {
+        guard let snapshot else { return nil }
+
+        return ExportHistoryEditableRecord(
+            documentTitle: snapshot.document.title,
+            sourceImageFilename: sourceImageFilename(for: id),
+            rotationQuarterTurns: snapshot.document.rotationQuarterTurns,
+            freeRotationDegrees: snapshot.document.freeRotationDegrees,
+            isFlippedHorizontally: snapshot.document.isFlippedHorizontally,
+            isFlippedVertically: snapshot.document.isFlippedVertically,
+            cropRect: snapshot.document.cropRect,
+            brightness: snapshot.document.brightness,
+            contrast: snapshot.document.contrast,
+            exposure: snapshot.document.exposure,
+            annotations: snapshot.annotations,
+            calibration: snapshot.calibration,
+            outputMeasurementUnit: snapshot.outputMeasurementUnit,
+            isAnnotationLayerVisible: snapshot.isAnnotationLayerVisible,
+            isMeasurementLayerVisible: snapshot.isMeasurementLayerVisible,
+            isGuideLayerVisible: snapshot.isGuideLayerVisible
+        )
+    }
+
+    private func editableSnapshot(
+        from record: ExportHistoryEditableRecord?
+    ) -> MSExportHistoryEditableSnapshot? {
+        guard let record else { return nil }
+
+        let sourceImageURL = exportHistoryDirectory.appendingPathComponent(record.sourceImageFilename)
+        guard let sourceImage = NSImage(contentsOf: sourceImageURL) else { return nil }
+
+        let documentSnapshot = MSImageDocumentSnapshot(
+            title: record.documentTitle,
+            originalImage: sourceImage,
+            rotationQuarterTurns: record.rotationQuarterTurns,
+            freeRotationDegrees: record.freeRotationDegrees,
+            isFlippedHorizontally: record.isFlippedHorizontally,
+            isFlippedVertically: record.isFlippedVertically,
+            cropRect: record.cropRect,
+            brightness: record.brightness,
+            contrast: record.contrast,
+            exposure: record.exposure
+        )
+
+        return MSExportHistoryEditableSnapshot(
+            document: documentSnapshot,
+            annotations: record.annotations,
+            calibration: record.calibration,
+            outputMeasurementUnit: record.outputMeasurementUnit,
+            isAnnotationLayerVisible: record.isAnnotationLayerVisible,
+            isMeasurementLayerVisible: record.isMeasurementLayerVisible,
+            isGuideLayerVisible: record.isGuideLayerVisible
+        )
+    }
+
+    private func removeEditableHistorySourceImage(for item: MSExportHistoryItem) {
+        guard item.editableSnapshot != nil else { return }
+        let url = exportHistoryDirectory.appendingPathComponent(sourceImageFilename(for: item.id))
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    private func sourceImageFilename(for id: UUID) -> String {
+        "\(id.uuidString)-source.png"
+    }
+
+    private var exportHistoryDirectory: URL {
+        let baseURL = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first ?? FileManager.default.temporaryDirectory
+
+        return baseURL
+            .appendingPathComponent("MeasureShot", isDirectory: true)
+            .appendingPathComponent("ExportHistory", isDirectory: true)
+    }
+
+    private var exportHistoryManifestURL: URL {
+        exportHistoryDirectory.appendingPathComponent(Self.exportHistoryManifestFilename)
     }
 
     func zoomIn() {

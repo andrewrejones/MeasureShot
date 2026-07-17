@@ -8,8 +8,23 @@ private let exportHistoryDateFormatter: DateFormatter = {
     return formatter
 }()
 
+private let annotationColourPresets: [(title: String, color: Color)] = [
+    ("Black", .black),
+    ("White", .white),
+    ("Red", .red),
+    ("Highlighter Green", Color(red: 0.25, green: 1.0, blue: 0.25)),
+    ("Highlighter Yellow", Color(red: 1.0, green: 0.92, blue: 0.05)),
+    ("Blue", .blue)
+]
+
 struct InspectorSidebar: View {
     @Environment(AppState.self) private var appState
+    @AppStorage("inspector.imageSectionExpanded") private var isImageSectionExpanded = true
+    @AppStorage("inspector.appearanceSectionExpanded") private var isAppearanceSectionExpanded = true
+    @AppStorage("inspector.layersSectionExpanded") private var isLayersSectionExpanded = true
+    @State private var comparisonFirstID: UUID?
+    @State private var comparisonSecondID: UUID?
+    @State private var comparisonResult: String?
 
     private var shouldShowMeasurementPanel: Bool {
         appState.selectedTool == .calibrate
@@ -35,6 +50,10 @@ struct InspectorSidebar: View {
     private var shouldShowBlurPanel: Bool {
         appState.selectedTool == .blur
             || appState.selectedAnnotation?.type == .blur
+    }
+
+    private var measuredRegions: [MSAnnotation] {
+        appState.measuredRegions()
     }
 
     private var textSection: some View {
@@ -171,6 +190,14 @@ struct InspectorSidebar: View {
                 activeToolSection
                 instructionsSection
 
+                if !measuredRegions.isEmpty {
+                    measuredRegionsSection
+                }
+
+                if measuredRegions.count >= 2 {
+                    regionComparisonSection
+                }
+
                 if appState.imageDocument != nil {
                     imageAdjustmentsSection
                 }
@@ -249,6 +276,83 @@ struct InspectorSidebar: View {
         }
     }
 
+    private var measuredRegionsSection: some View {
+        GroupBox("Measured Regions") {
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(Array(measuredRegions.enumerated()), id: \.element.id) { _, annotation in
+                    regionMeasurementRow(annotation)
+
+                    if annotation.id != measuredRegions.last?.id {
+                        Divider()
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func regionMeasurementRow(_ annotation: MSAnnotation) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                TextField(
+                    "Region name",
+                    text: Binding(
+                        get: { appState.regionTitle(for: annotation) },
+                        set: { appState.updateRegionTitle(id: annotation.id, title: $0) }
+                    )
+                )
+                .textFieldStyle(.roundedBorder)
+                .font(.subheadline)
+
+                Spacer()
+
+                Button {
+                    appState.selectAnnotation(id: annotation.id)
+                    appState.selectedTool = .select
+                } label: {
+                    Image(systemName: appState.selectedAnnotationID == annotation.id ? "checkmark.circle.fill" : "scope")
+                }
+                .buttonStyle(.borderless)
+                .help("Select \(appState.regionTitle(for: annotation))")
+
+                Button(role: .destructive) {
+                    appState.deleteAnnotation(id: annotation.id)
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .buttonStyle(.borderless)
+                .help("Delete \(appState.regionTitle(for: annotation))")
+            }
+
+            ForEach(
+                annotation.regionMeasurementLines(
+                    calibration: appState.calibration,
+                    outputUnit: appState.outputMeasurementUnit
+                ),
+                id: \.self
+            ) { line in
+                Text(line)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if let averageColor = appState.averageColor(for: annotation) {
+                Divider()
+
+                Text("Average HEX: \(averageColor.hex)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+
+                Text("Average RGB: \(averageColor.rgb)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+        }
+    }
+
     private var exportHistorySection: some View {
         GroupBox("Export History") {
             VStack(alignment: .leading, spacing: 10) {
@@ -262,13 +366,14 @@ struct InspectorSidebar: View {
                     .buttonStyle(.link)
                 }
 
-                ForEach(appState.exportHistory) { item in
+                ForEach(appState.exportHistory.prefix(6)) { item in
                     exportHistoryRow(item)
 
-                    if item.id != appState.exportHistory.last?.id {
+                    if item.id != appState.exportHistory.prefix(6).last?.id {
                         Divider()
                     }
                 }
+
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -331,7 +436,7 @@ struct InspectorSidebar: View {
     }
 
     private var imageAdjustmentsSection: some View {
-        GroupBox("Image") {
+        DisclosureGroup(isExpanded: $isImageSectionExpanded) {
             VStack(alignment: .leading, spacing: 12) {
                 adjustmentSlider(
                     title: "Brightness",
@@ -376,6 +481,9 @@ struct InspectorSidebar: View {
                 )
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.top, 8)
+        } label: {
+            Label("Image", systemImage: "photo")
         }
     }
 
@@ -410,18 +518,43 @@ struct InspectorSidebar: View {
     }
 
     private var appearanceSection: some View {
-        GroupBox("Appearance") {
+        DisclosureGroup(isExpanded: $isAppearanceSectionExpanded) {
             VStack(alignment: .leading, spacing: 12) {
                 ColorPicker(
-                    "Colour",
+                    "Custom Colour",
                     selection: Binding(
                         get: { appState.annotationColor },
                         set: { newColor in
-                            appState.annotationColor = newColor
-                            appState.applyCurrentStyleToSelection()
+                            appState.setAnnotationColor(newColor)
                         }
                     )
                 )
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Presets")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    HStack(spacing: 8) {
+                        ForEach(annotationColourPresets.indices, id: \.self) { index in
+                            let preset = annotationColourPresets[index]
+
+                            Button {
+                                appState.setAnnotationColor(preset.color)
+                            } label: {
+                                Circle()
+                                    .fill(preset.color)
+                                    .frame(width: 22, height: 22)
+                                    .overlay(
+                                        Circle()
+                                            .stroke(.secondary.opacity(0.45), lineWidth: 1)
+                                    )
+                            }
+                            .buttonStyle(.plain)
+                            .help(preset.title)
+                        }
+                    }
+                }
 
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
@@ -435,8 +568,7 @@ struct InspectorSidebar: View {
                         value: Binding(
                             get: { Double(appState.annotationLineWidth) },
                             set: { newValue in
-                                appState.annotationLineWidth = CGFloat(newValue)
-                                appState.applyCurrentStyleToSelection()
+                                appState.setAnnotationLineWidth(CGFloat(newValue))
                             }
                         ),
                         in: 1...12,
@@ -451,6 +583,19 @@ struct InspectorSidebar: View {
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.top, 8)
+        } label: {
+            HStack {
+                Label("Appearance", systemImage: "paintpalette")
+                Spacer()
+                Circle()
+                    .fill(appState.annotationColor)
+                    .frame(width: 14, height: 14)
+                    .overlay(Circle().stroke(.secondary.opacity(0.45), lineWidth: 1))
+                Text("\(appState.annotationLineWidth, specifier: "%.1f") pt")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 
@@ -468,6 +613,85 @@ struct InspectorSidebar: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+    }
+
+    private var regionComparisonSection: some View {
+        GroupBox("Compare Regions") {
+            VStack(alignment: .leading, spacing: 10) {
+                Picker("First", selection: comparisonFirstBinding) {
+                    ForEach(measuredRegions) { annotation in
+                        Text(appState.regionTitle(for: annotation)).tag(Optional(annotation.id))
+                    }
+                }
+
+                Picker("Second", selection: comparisonSecondBinding) {
+                    ForEach(measuredRegions) { annotation in
+                        Text(appState.regionTitle(for: annotation)).tag(Optional(annotation.id))
+                    }
+                }
+
+                Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 8) {
+                    GridRow {
+                        Button("Area Ratio") {
+                            compareRegions(metric: .area, operation: .ratio)
+                        }
+                        Button("Area %") {
+                            compareRegions(metric: .area, operation: .percentage)
+                        }
+                    }
+
+                    GridRow {
+                        Button("Area Difference") {
+                            compareRegions(metric: .area, operation: .difference)
+                        }
+                        Button("Area Product") {
+                            compareRegions(metric: .area, operation: .product)
+                        }
+                    }
+
+                    GridRow {
+                        Button("Perimeter Ratio") {
+                            compareRegions(metric: .perimeter, operation: .ratio)
+                        }
+                        Button("Perimeter %") {
+                            compareRegions(metric: .perimeter, operation: .percentage)
+                        }
+                    }
+                }
+                .buttonStyle(.bordered)
+
+                if let comparisonResult {
+                    Text(comparisonResult)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .onAppear {
+                ensureComparisonSelection()
+            }
+            .onChange(of: measuredRegions.map(\.id)) {
+                ensureComparisonSelection()
+            }
+        }
+    }
+
+    private var comparisonFirstBinding: Binding<UUID?> {
+        Binding(
+            get: { comparisonFirstID ?? measuredRegions.first?.id },
+            set: { comparisonFirstID = $0 }
+        )
+    }
+
+    private var comparisonSecondBinding: Binding<UUID?> {
+        Binding(
+            get: {
+                comparisonSecondID
+                    ?? measuredRegions.first { $0.id != (comparisonFirstID ?? measuredRegions.first?.id) }?.id
+            },
+            set: { comparisonSecondID = $0 }
+        )
     }
 
     private var outputUnitPicker: some View {
@@ -542,14 +766,151 @@ struct InspectorSidebar: View {
         }
     }
 
+    private enum RegionComparisonMetric {
+        case area
+        case perimeter
+    }
+
+    private enum RegionComparisonOperation {
+        case ratio
+        case difference
+        case product
+        case percentage
+    }
+
+    private func ensureComparisonSelection() {
+        let ids = measuredRegions.map(\.id)
+        guard ids.count >= 2 else {
+            comparisonFirstID = nil
+            comparisonSecondID = nil
+            comparisonResult = nil
+            appState.latestComparisonResult = nil
+            return
+        }
+
+        if comparisonFirstID == nil || !ids.contains(comparisonFirstID!) {
+            comparisonFirstID = ids[0]
+        }
+
+        if comparisonSecondID == nil || comparisonSecondID == comparisonFirstID || !ids.contains(comparisonSecondID!) {
+            comparisonSecondID = ids.first { $0 != comparisonFirstID }
+        }
+    }
+
+    private func compareRegions(
+        metric: RegionComparisonMetric,
+        operation: RegionComparisonOperation
+    ) {
+        ensureComparisonSelection()
+
+        guard let firstID = comparisonFirstID,
+              let secondID = comparisonSecondID,
+              let first = measuredRegions.first(where: { $0.id == firstID }),
+              let second = measuredRegions.first(where: { $0.id == secondID }) else {
+            comparisonResult = "Choose two regions to compare."
+            appState.latestComparisonResult = comparisonResult
+            return
+        }
+
+        let firstValue = comparisonValue(for: first, metric: metric)
+        let secondValue = comparisonValue(for: second, metric: metric)
+        let metricTitle = metric == .area ? "Area" : "Perimeter"
+
+        switch operation {
+        case .ratio:
+            guard secondValue != 0 else {
+                comparisonResult = "\(metricTitle) ratio unavailable: second value is zero."
+                appState.latestComparisonResult = comparisonResult
+                return
+            }
+            comparisonResult = String(
+                format: "%@ ratio: %.3f : 1. %@",
+                metricTitle,
+                firstValue / secondValue,
+                percentageComparisonText(firstValue: firstValue, secondValue: secondValue)
+            )
+        case .difference:
+            comparisonResult = String(
+                format: "%@ difference: %@",
+                metricTitle,
+                formattedComparisonValue(abs(firstValue - secondValue), metric: metric)
+            )
+        case .product:
+            comparisonResult = String(format: "%@ product: %.3f", metricTitle, firstValue * secondValue)
+        case .percentage:
+            guard secondValue != 0 else {
+                comparisonResult = "\(metricTitle) percentage unavailable: second value is zero."
+                appState.latestComparisonResult = comparisonResult
+                return
+            }
+            comparisonResult = "\(metricTitle): \(percentageComparisonText(firstValue: firstValue, secondValue: secondValue))"
+        }
+
+        appState.latestComparisonResult = comparisonResult
+    }
+
+    private func percentageComparisonText(firstValue: Double, secondValue: Double) -> String {
+        guard secondValue != 0 else { return "Second value is zero." }
+
+        let percentChange = ((firstValue - secondValue) / secondValue) * 100
+        if abs(percentChange) < 0.05 {
+            return "First is about the same as second."
+        }
+
+        let direction = percentChange > 0 ? "bigger" : "smaller"
+        return String(format: "First is %.1f%% %@ than second.", abs(percentChange), direction)
+    }
+
+    private func comparisonValue(
+        for annotation: MSAnnotation,
+        metric: RegionComparisonMetric
+    ) -> Double {
+        switch metric {
+        case .area:
+            if let calibration = appState.calibration,
+               let converted = calibration.convertedArea(
+                forSquarePixels: annotation.regionAreaSquarePixels,
+                to: appState.outputMeasurementUnit
+               ) {
+                return converted
+            }
+            return annotation.regionAreaSquarePixels
+        case .perimeter:
+            if let calibration = appState.calibration,
+               let converted = calibration.convertedLength(
+                forPixels: annotation.regionPerimeterPixels,
+                to: appState.outputMeasurementUnit
+               ) {
+                return converted
+            }
+            return annotation.regionPerimeterPixels
+        }
+    }
+
+    private func formattedComparisonValue(
+        _ value: Double,
+        metric: RegionComparisonMetric
+    ) -> String {
+        let unit = appState.calibration == nil ? "px" : appState.outputMeasurementUnit.rawValue
+        switch metric {
+        case .area:
+            return String(format: "%.2f %@²", value, unit)
+        case .perimeter:
+            return String(format: "%.2f %@", value, unit)
+        }
+    }
+
     private var layersSection: some View {
-        GroupBox("Layers") {
+        DisclosureGroup(isExpanded: $isLayersSectionExpanded) {
             VStack(spacing: 8) {
                 ForEach(MSCanvasLayer.allCases) { layer in
                     layerRow(layer)
                 }
             }
             .frame(maxWidth: .infinity)
+            .padding(.top, 8)
+        } label: {
+            Label("Layers", systemImage: "square.3.layers.3d")
         }
     }
 
@@ -562,13 +923,19 @@ struct InspectorSidebar: View {
         case .calibrate:
             return "Draw over a known distance, then enter its real-world length and unit."
         case .angle:
-            return "Drag the baseline. MeasureShot creates a 90° arm automatically. Then drag a third line from the end of that arm; the displayed value is its signed angular difference from the original baseline."
+            return "Drag from the pivot to the end of the first line. Then drag from the same pivot to the end of the second line to show the angle between them."
+        case .parallelAngle:
+            return "Drag the baseline. MeasureShot creates a 90° arm automatically. Then drag a separate line from the end of that arm to measure its signed angular difference from the original baseline."
         case .arrow:
             return "Drag from the arrow tail to its tip."
         case .rectangle:
             return "Drag diagonally to draw a rectangle."
         case .ellipse:
-            return "Drag diagonally to draw an ellipse."
+            return "Drag diagonally to draw an ellipse. Hold Shift while dragging to make a perfect circle."
+        case .pen:
+            return "Drag to draw a quick freehand annotation."
+        case .region:
+            return "Drag around an object to trace a closed measured region. MeasureShot shows its area and perimeter."
         case .text:
             return "Click the image where you want to place text."
         case .blur:

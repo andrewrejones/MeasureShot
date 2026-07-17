@@ -7,7 +7,7 @@ struct MeasureShotApp: App {
     @State private var appState = AppState()
 
     var body: some Scene {
-        WindowGroup("MeasureShot") {
+        Window("MeasureShot", id: "main") {
             EditorView()
                 .environment(appState)
                 .task {

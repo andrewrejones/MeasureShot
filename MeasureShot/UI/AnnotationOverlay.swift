@@ -8,6 +8,7 @@ struct AnnotationOverlay: View {
     let scale: CGFloat
     let calibration: MSCalibration?
     let outputUnit: MSMeasurementUnit
+    let regionTitleProvider: (MSAnnotation) -> String
 
     var body: some View {
         Canvas { context, _ in
@@ -48,6 +49,14 @@ struct AnnotationOverlay: View {
             }
 
         case .angle:
+            drawPivotAngle(
+                annotation,
+                color: color,
+                lineWidth: lineWidth,
+                in: &context
+            )
+
+        case .parallelAngle:
             drawAngle(
                 annotation,
                 color: color,
@@ -58,16 +67,39 @@ struct AnnotationOverlay: View {
         case .arrow:
             drawArrow(from: start, to: end, color: color, lineWidth: lineWidth, in: &context)
 
+        case .pen:
+            drawFreehand(
+                annotation,
+                closePath: false,
+                color: color,
+                lineWidth: lineWidth,
+                feathered: true,
+                in: &context
+            )
+
+        case .region:
+            drawFreehand(
+                annotation,
+                closePath: true,
+                color: color,
+                lineWidth: lineWidth,
+                feathered: false,
+                in: &context
+            )
+            drawRegionLabel(annotation, in: &context)
+
         case .rectangle:
             context.stroke(
                 Path(annotation.normalizedRect.applying(CGAffineTransform(scaleX: scale, y: scale))),
                 with: .color(color),
                 lineWidth: lineWidth
             )
+            drawRegionLabel(annotation, in: &context)
 
         case .ellipse:
             let rect = annotation.normalizedRect.applying(CGAffineTransform(scaleX: scale, y: scale))
             context.stroke(Path(ellipseIn: rect), with: .color(color), lineWidth: lineWidth)
+            drawRegionLabel(annotation, in: &context)
 
         case .text:
             let label = Text(annotation.text)
@@ -161,6 +193,47 @@ struct AnnotationOverlay: View {
         }
     }
 
+    private func drawPivotAngle(
+        _ annotation: MSAnnotation,
+        color: Color,
+        lineWidth: CGFloat,
+        in context: inout GraphicsContext
+    ) {
+        let pivot = scaled(annotation.start)
+        let firstEnd = scaled(annotation.end)
+
+        var path = Path()
+        path.move(to: pivot)
+        path.addLine(to: firstEnd)
+
+        if let thirdPoint = annotation.thirdPoint {
+            path.move(to: pivot)
+            path.addLine(to: scaled(thirdPoint))
+        }
+
+        context.stroke(path, with: .color(color), lineWidth: lineWidth)
+
+        let pivotDot = CGRect(x: pivot.x - 4, y: pivot.y - 4, width: 8, height: 8)
+        context.fill(Path(ellipseIn: pivotDot), with: .color(color))
+
+        if annotation.thirdPoint != nil {
+            let label = Text(
+                annotation.displayValue(
+                    calibration: calibration,
+                    outputUnit: outputUnit
+                )
+            )
+            .font(.system(size: max(11, 12 * scale), weight: .semibold, design: .rounded))
+            .foregroundColor(.white)
+
+            context.draw(
+                label,
+                at: CGPoint(x: pivot.x + 12, y: pivot.y - 18),
+                anchor: .leading
+            )
+        }
+    }
+
     private func drawArrow(
         from start: CGPoint,
         to end: CGPoint,
@@ -207,7 +280,75 @@ struct AnnotationOverlay: View {
         context.draw(label, at: CGPoint(x: midpoint.x, y: midpoint.y - 12))
     }
 
+    private func drawRegionLabel(_ annotation: MSAnnotation, in context: inout GraphicsContext) {
+        let labelText = regionTitleProvider(annotation)
+        guard !labelText.isEmpty else { return }
+
+        let label = Text(labelText)
+            .font(.system(size: max(10, 12 * scale), weight: .semibold, design: .rounded))
+            .foregroundColor(.white)
+
+        context.draw(label, at: scaled(annotation.centre), anchor: .center)
+    }
+
+    private func drawFreehand(
+        _ annotation: MSAnnotation,
+        closePath: Bool,
+        color: Color,
+        lineWidth: CGFloat,
+        feathered: Bool,
+        in context: inout GraphicsContext
+    ) {
+        guard let firstPoint = annotation.points.first else { return }
+
+        var path = Path()
+        path.move(to: scaled(firstPoint))
+
+        for point in annotation.points.dropFirst() {
+            path.addLine(to: scaled(point))
+        }
+
+        if closePath {
+            path.closeSubpath()
+            context.fill(path, with: .color(color.opacity(0.12)))
+        }
+
+        if feathered {
+            context.stroke(
+                path,
+                with: .color(color.opacity(0.16)),
+                style: StrokeStyle(lineWidth: lineWidth * 2.8, lineCap: .round, lineJoin: .round)
+            )
+            context.stroke(
+                path,
+                with: .color(color.opacity(0.24)),
+                style: StrokeStyle(lineWidth: lineWidth * 1.8, lineCap: .round, lineJoin: .round)
+            )
+        }
+
+        context.stroke(
+            path,
+            with: .color(color),
+            style: StrokeStyle(lineWidth: lineWidth, lineCap: .round, lineJoin: .round)
+        )
+    }
+
     private func drawSelectionHandles(_ annotation: MSAnnotation, in context: inout GraphicsContext) {
+        if annotation.type == .pen || annotation.type == .region {
+            guard !annotation.points.isEmpty else { return }
+
+            let rect = annotation.points.reduce(CGRect.null) { partialResult, point in
+                partialResult.union(CGRect(origin: scaled(point), size: .zero))
+            }.insetBy(dx: -6, dy: -6)
+
+            context.stroke(
+                Path(rect),
+                with: .color(.accentColor.opacity(0.75)),
+                style: StrokeStyle(lineWidth: 1, dash: [5, 4])
+            )
+            return
+        }
+
         var points = [scaled(annotation.start), scaled(annotation.end)]
 
         if let thirdPoint = annotation.thirdPoint {

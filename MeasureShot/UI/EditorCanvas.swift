@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import CoreImage
 
@@ -131,13 +132,17 @@ struct EditorCanvas: View {
                             if appState.isMeasurementLayerVisible {
                                 AnnotationOverlay(
                                     annotations: appState.annotations.filter {
-                                        $0.type == .measurement || $0.type == .calibration || $0.type == .angle
+                                        $0.type == .measurement
+                                            || $0.type == .calibration
+                                            || $0.type == .angle
+                                            || $0.type == .parallelAngle
                                     },
                                     inProgress: measurementPreview,
                                     selectedAnnotationID: appState.selectedAnnotationID,
                                     scale: effectiveScale,
                                     calibration: appState.calibration,
-                                    outputUnit: appState.outputMeasurementUnit
+                                    outputUnit: appState.outputMeasurementUnit,
+                                    regionTitleProvider: { appState.regionTitle(for: $0) }
                                 )
                             }
 
@@ -148,6 +153,8 @@ struct EditorCanvas: View {
                                             || $0.type == .line
                                             || $0.type == .rectangle
                                             || $0.type == .ellipse
+                                            || $0.type == .pen
+                                            || $0.type == .region
                                             || $0.type == .text
                                             || $0.type == .blur
                                     },
@@ -155,7 +162,8 @@ struct EditorCanvas: View {
                                     selectedAnnotationID: appState.selectedAnnotationID,
                                     scale: effectiveScale,
                                     calibration: appState.calibration,
-                                    outputUnit: appState.outputMeasurementUnit
+                                    outputUnit: appState.outputMeasurementUnit,
+                                    regionTitleProvider: { appState.regionTitle(for: $0) }
                                 )
                             }
 
@@ -291,7 +299,7 @@ struct EditorCanvas: View {
     private var annotationPreview: MSAnnotation? {
         guard let annotation = appState.inProgressAnnotation else { return nil }
         switch annotation.type {
-        case .arrow, .line, .rectangle, .ellipse, .blur:
+        case .arrow, .line, .rectangle, .ellipse, .pen, .region, .blur:
             return annotation
         default:
             return nil
@@ -309,7 +317,7 @@ struct EditorCanvas: View {
     private var measurementPreview: MSAnnotation? {
         guard let annotation = appState.inProgressAnnotation else { return nil }
         switch annotation.type {
-        case .measurement, .calibration, .angle:
+        case .measurement, .calibration, .angle, .parallelAngle:
             return annotation
         default:
             return nil
@@ -387,7 +395,7 @@ struct EditorCanvas: View {
                     appState.beginAnnotation(type: annotationType, at: imagePoint)
                 }
 
-                appState.updateAnnotation(to: imagePoint)
+                appState.updateAnnotation(to: drawingPoint(for: imagePoint))
             }
             .onEnded { value in
                 defer {
@@ -436,9 +444,26 @@ struct EditorCanvas: View {
 
                 guard appState.canDrawWithSelectedTool() else { return }
                 let imagePoint = clampedImagePoint(value.location, scale: scale, imageSize: imageSize)
-                appState.updateAnnotation(to: imagePoint)
+                appState.updateAnnotation(to: drawingPoint(for: imagePoint))
                 appState.finishAnnotation()
             }
+    }
+
+    private func drawingPoint(for point: CGPoint) -> CGPoint {
+        guard appState.selectedTool == .ellipse,
+              NSEvent.modifierFlags.contains(.shift),
+              let start = appState.inProgressAnnotation?.start else {
+            return point
+        }
+
+        let deltaX = point.x - start.x
+        let deltaY = point.y - start.y
+        let side = min(abs(deltaX), abs(deltaY))
+
+        return CGPoint(
+            x: start.x + side * (deltaX < 0 ? -1 : 1),
+            y: start.y + side * (deltaY < 0 ? -1 : 1)
+        )
     }
 
     private func updateCropDrag(to point: CGPoint, imageSize: CGSize, scale: CGFloat) {
@@ -543,6 +568,7 @@ struct EditorCanvas: View {
 
     private func endpointHitTest(_ point: CGPoint, scale: CGFloat) -> AnnotationEndpoint? {
         guard let annotation = appState.selectedAnnotation else { return nil }
+        guard annotation.type != .pen else { return nil }
         let tolerance = max(8, 10 / max(scale, 0.01))
 
         if hypot(point.x - annotation.start.x, point.y - annotation.start.y) <= tolerance {
@@ -586,7 +612,34 @@ struct EditorCanvas: View {
                     return annotation.id
                 }
 
+            case .pen, .region:
+                if freehandHitTest(point, annotation: annotation) {
+                    return annotation.id
+                }
+
             case .angle:
+                let firstArmHit = distanceFromPoint(
+                    point,
+                    toSegmentFrom: annotation.start,
+                    to: annotation.end
+                ) <= 8
+
+                let secondArmHit: Bool
+                if let thirdPoint = annotation.thirdPoint {
+                    secondArmHit = distanceFromPoint(
+                        point,
+                        toSegmentFrom: annotation.start,
+                        to: thirdPoint
+                    ) <= 8
+                } else {
+                    secondArmHit = false
+                }
+
+                if firstArmHit || secondArmHit {
+                    return annotation.id
+                }
+
+            case .parallelAngle:
                 let baselineHit = distanceFromPoint(
                     point,
                     toSegmentFrom: annotation.start,
@@ -652,6 +705,25 @@ struct EditorCanvas: View {
             height: height
         )
     }
+
+    private func freehandHitTest(_ point: CGPoint, annotation: MSAnnotation) -> Bool {
+        guard annotation.points.count > 1 else {
+            return annotation.points.contains { hypot(point.x - $0.x, point.y - $0.y) <= 8 }
+        }
+
+        for index in 1..<annotation.points.count {
+            if distanceFromPoint(
+                point,
+                toSegmentFrom: annotation.points[index - 1],
+                to: annotation.points[index]
+            ) <= max(8, annotation.stroke.lineWidth + 4) {
+                return true
+            }
+        }
+
+        return false
+    }
+
     private func colourAtCanvasPoint(
         _ point: CGPoint,
         scale: CGFloat,

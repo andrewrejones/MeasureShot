@@ -10,10 +10,16 @@ import CoreImage
 
 struct EditorView: View {
     @Environment(AppState.self) private var appState
+    @State private var editingTabID: UUID?
+    @State private var editingTabTitle = ""
+    @State private var isShowingExportPreview = false
 
     var body: some View {
         VStack(spacing: 0) {
             topToolbar
+            if !appState.screenshotTabs.isEmpty {
+                screenshotTabBar
+            }
             Divider()
 
             HSplitView {
@@ -34,6 +40,10 @@ struct EditorView: View {
             statusBar
         }
         .frame(minWidth: 980, minHeight: 680)
+        .sheet(isPresented: $isShowingExportPreview) {
+            ExportPreviewSheet()
+                .environment(appState)
+        }
     }
 
     private var topToolbar: some View {
@@ -43,6 +53,18 @@ struct EditorView: View {
                     appState.startCapture()
                 } label: {
                     ToolbarIconLabel("Capture", systemImage: "camera.viewfinder")
+                }
+
+                Button {
+                    appState.insertImage()
+                } label: {
+                    ToolbarIconLabel("Insert", systemImage: "photo.badge.plus")
+                }
+
+                Button {
+                    appState.createBlankTab()
+                } label: {
+                    ToolbarIconLabel("New Tab", systemImage: "plus.rectangle.on.rectangle")
                 }
 
                 Button(role: .destructive) {
@@ -73,6 +95,27 @@ struct EditorView: View {
                     appState.shareImage()
                 } label: {
                     ToolbarIconLabel("Share", systemImage: "square.and.arrow.up")
+                }
+                .disabled(appState.imageDocument == nil)
+
+                Menu {
+                    Button {
+                        isShowingExportPreview = true
+                    } label: {
+                        Label("Preview Export...", systemImage: "eye")
+                    }
+
+                    Divider()
+
+                    ForEach(MSExportOption.allCases) { option in
+                        Button {
+                            appState.export(option: option)
+                        } label: {
+                            Label(option.title, systemImage: option.systemImage)
+                        }
+                    }
+                } label: {
+                    ToolbarIconLabel("Export", systemImage: "square.and.arrow.down.on.square")
                 }
                 .disabled(appState.imageDocument == nil)
 
@@ -221,6 +264,94 @@ struct EditorView: View {
         )
     }
 
+    private var screenshotTabBar: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(appState.screenshotTabs) { tab in
+                    HStack(spacing: 6) {
+                        HStack(spacing: 6) {
+                            Button {
+                                appState.selectScreenshotTab(id: tab.id)
+                            } label: {
+                                Image(systemName: "photo")
+                            }
+                            .buttonStyle(.plain)
+
+                            if editingTabID == tab.id {
+                                TextField(
+                                    "Tab name",
+                                    text: $editingTabTitle
+                                )
+                                .textFieldStyle(.plain)
+                                .frame(width: 110)
+                                .onSubmit {
+                                    commitTabRename(id: tab.id)
+                                }
+                            } else {
+                                Button {
+                                    appState.selectScreenshotTab(id: tab.id)
+                                } label: {
+                                    Text(tab.title)
+                                        .lineLimit(1)
+                                        .frame(width: 110, alignment: .leading)
+                                }
+                                .buttonStyle(.plain)
+                            }
+
+                            Button {
+                                if editingTabID == tab.id {
+                                    commitTabRename(id: tab.id)
+                                } else {
+                                    editingTabID = tab.id
+                                    editingTabTitle = tab.title
+                                    appState.selectScreenshotTab(id: tab.id)
+                                }
+                            } label: {
+                                Image(systemName: editingTabID == tab.id ? "checkmark" : "pencil")
+                                    .font(.system(size: 10, weight: .semibold))
+                                    .frame(width: 16, height: 16)
+                            }
+                            .buttonStyle(.plain)
+                            .help(editingTabID == tab.id ? "Done Renaming" : "Rename Tab")
+                        }
+                        .padding(.leading, 8)
+                        .padding(.vertical, 5)
+
+                        Button {
+                            appState.closeScreenshotTab(id: tab.id)
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 10, weight: .semibold))
+                                .frame(width: 16, height: 16)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Close Screenshot")
+                    }
+                    .padding(.trailing, 5)
+                    .background(
+                        RoundedRectangle(cornerRadius: 7)
+                            .fill(tab.isSelected ? Color.accentColor.opacity(0.18) : Color(nsColor: .controlBackgroundColor))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 7)
+                            .stroke(tab.isSelected ? Color.accentColor.opacity(0.45) : Color.secondary.opacity(0.2))
+                    )
+                }
+
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+        }
+        .background(.thinMaterial)
+    }
+
+    private func commitTabRename(id: UUID) {
+        appState.renameScreenshotTab(id: id, title: editingTabTitle)
+        editingTabID = nil
+        editingTabTitle = ""
+    }
+
     private var statusBar: some View {
         HStack {
             Text(appState.statusMessage)
@@ -253,6 +384,71 @@ struct EditorView: View {
     }
 }
 
+private struct ExportPreviewSheet: View {
+    @Environment(AppState.self) private var appState
+    @Environment(\.dismiss) private var dismiss
+    @State private var selectedOption: MSExportOption = .standard
+
+    private var previewOptions: [MSExportOption] {
+        MSExportOption.allCases.filter { $0 != .annotationsCSV }
+    }
+
+    private var previewImage: NSImage? {
+        appState.exportPreviewImage(for: selectedOption)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Picker("Export Type", selection: $selectedOption) {
+                    ForEach(previewOptions) { option in
+                        Label(option.title, systemImage: option.systemImage)
+                            .tag(option)
+                    }
+                }
+                .pickerStyle(.menu)
+                .frame(width: 240)
+
+                Spacer()
+
+                Button("Cancel") {
+                    dismiss()
+                }
+
+                Button {
+                    appState.export(option: selectedOption)
+                } label: {
+                    Label("Save", systemImage: "square.and.arrow.down")
+                }
+                .buttonStyle(.borderedProminent)
+            }
+
+            if let previewImage {
+                ScrollView([.horizontal, .vertical]) {
+                    Image(nsImage: previewImage)
+                        .resizable()
+                        .interpolation(.high)
+                        .scaledToFit()
+                        .frame(maxWidth: 760, maxHeight: 520)
+                        .padding(16)
+                }
+                .frame(width: 820, height: 560)
+                .background(Color(nsColor: .controlBackgroundColor))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+            } else {
+                ContentUnavailableView(
+                    "No Preview",
+                    systemImage: "eye.slash",
+                    description: Text("This export type does not produce an image preview.")
+                )
+                .frame(width: 820, height: 560)
+            }
+        }
+        .padding(18)
+        .frame(width: 860)
+    }
+}
+
 private struct ToolbarIconLabel: View {
     let title: String
     let systemImage: String
@@ -282,4 +478,3 @@ private struct ToolbarIconLabel: View {
     EditorView()
         .environment(AppState())
 }
-
