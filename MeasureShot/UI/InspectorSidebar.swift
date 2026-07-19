@@ -207,6 +207,10 @@ struct InspectorSidebar: View {
                 activeToolSection
                 instructionsSection
 
+                if appState.isTraceInProgress {
+                    traceControlsSection
+                }
+
                 if !measuredItems.isEmpty {
                     measuredItemsSection
                 }
@@ -303,6 +307,25 @@ struct InspectorSidebar: View {
                 Spacer()
             }
             .frame(maxWidth: .infinity)
+        }
+    }
+
+    private var traceControlsSection: some View {
+        GroupBox("Trace") {
+            HStack(spacing: 8) {
+                Button {
+                    appState.finishTrace()
+                } label: {
+                    Label("Finish Trace", systemImage: "checkmark")
+                }
+
+                Button(role: .cancel) {
+                    appState.cancelTrace()
+                } label: {
+                    Label("Cancel", systemImage: "xmark")
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
@@ -1233,6 +1256,8 @@ struct InspectorSidebar: View {
             return "Drag to draw a quick freehand annotation."
         case .region:
             return "Drag around an object to trace a closed measured region. MeasureShot shows its area and perimeter."
+        case .trace:
+            return "Click along an edge to add snapped trace points. Click near the start to close it into a measured region, or use Finish Trace to keep it open."
         case .text:
             return "Click the image where you want to place text."
         case .blur:

@@ -77,6 +77,19 @@ struct AnnotationOverlay: View {
                 in: &context
             )
 
+        case .trace:
+            drawFreehand(
+                annotation,
+                closePath: false,
+                color: color,
+                lineWidth: lineWidth,
+                feathered: false,
+                in: &context
+            )
+            if !selected {
+                drawPathPointHandles(annotation, in: &context)
+            }
+
         case .region:
             drawFreehand(
                 annotation,
@@ -334,7 +347,7 @@ struct AnnotationOverlay: View {
     }
 
     private func drawSelectionHandles(_ annotation: MSAnnotation, in context: inout GraphicsContext) {
-        if annotation.type == .pen || annotation.type == .region {
+        if annotation.type == .pen || annotation.type == .region || annotation.type == .trace {
             guard !annotation.points.isEmpty else { return }
 
             let rect = annotation.points.reduce(CGRect.null) { partialResult, point in
@@ -346,6 +359,10 @@ struct AnnotationOverlay: View {
                 with: .color(.accentColor.opacity(0.75)),
                 style: StrokeStyle(lineWidth: 1, dash: [5, 4])
             )
+
+            if annotation.type == .region || annotation.type == .trace {
+                drawPathPointHandles(annotation, in: &context)
+            }
             return
         }
 
@@ -362,6 +379,28 @@ struct AnnotationOverlay: View {
         for point in points {
             let rect = CGRect(x: point.x - 5, y: point.y - 5, width: 10, height: 10)
             context.fill(Path(ellipseIn: rect), with: .color(.white))
+            context.stroke(Path(ellipseIn: rect), with: .color(.accentColor), lineWidth: 2)
+        }
+    }
+
+    private func drawPathPointHandles(_ annotation: MSAnnotation, in context: inout GraphicsContext) {
+        for (index, point) in annotation.points.enumerated() {
+            if annotation.type == .region,
+               index == annotation.points.count - 1,
+               annotation.points.count > 2 {
+                continue
+            }
+
+            let centre = scaled(point)
+            let radius = index == 0 ? 5.5 : 4.5
+            let rect = CGRect(
+                x: centre.x - radius,
+                y: centre.y - radius,
+                width: radius * 2,
+                height: radius * 2
+            )
+
+            context.fill(Path(ellipseIn: rect), with: .color(.white.opacity(0.95)))
             context.stroke(Path(ellipseIn: rect), with: .color(.accentColor), lineWidth: 2)
         }
     }

@@ -198,7 +198,7 @@ enum ExportRenderer {
         case .measurement, .calibration, .angle, .parallelAngle:
             return showMeasurements
 
-        case .line, .arrow, .rectangle, .ellipse, .pen, .region, .text:
+        case .line, .arrow, .rectangle, .ellipse, .pen, .region, .trace, .text:
             return showAnnotations
 
         case .blur:
@@ -263,6 +263,7 @@ enum ExportRenderer {
         case .ellipse: base = "Ellipse"
         case .pen: base = "Pen"
         case .region: base = "Region"
+        case .trace: base = "Trace"
         case .text: base = "Text"
         case .blur: base = "Blur"
         }
@@ -408,6 +409,9 @@ enum ExportRenderer {
 
         case .pen:
             drawFreehand(annotation, closePath: false, feathered: true, in: context)
+
+        case .trace:
+            drawFreehand(annotation, closePath: false, feathered: false, in: context)
 
         case .region:
             drawFreehand(annotation, closePath: true, feathered: false, in: context)

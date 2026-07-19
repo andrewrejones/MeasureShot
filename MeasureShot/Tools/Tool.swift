@@ -11,6 +11,7 @@ enum MSToolType: String, CaseIterable, Identifiable, Sendable {
     case rectangle
     case ellipse
     case region
+    case trace
     case pen
     case text
     case blur
@@ -30,8 +31,9 @@ enum MSToolType: String, CaseIterable, Identifiable, Sendable {
         case .arrow: "Arrow"
         case .rectangle: "Rectangle"
         case .ellipse: "Ellipse"
-        case .pen: "Pen"
         case .region: "Region"
+        case .trace: "Trace"
+        case .pen: "Pen"
         case .text: "Text"
         case .blur: "Blur"
         case .crop: "Crop"
@@ -50,8 +52,9 @@ enum MSToolType: String, CaseIterable, Identifiable, Sendable {
         case .arrow: "arrow.up.right"
         case .rectangle: "rectangle"
         case .ellipse: "circle"
-        case .pen: "pencil.tip"
         case .region: "lasso"
+        case .trace: "waveform.path.ecg"
+        case .pen: "pencil.tip"
         case .text: "textformat"
         case .blur: "drop"
         case .crop: "crop"

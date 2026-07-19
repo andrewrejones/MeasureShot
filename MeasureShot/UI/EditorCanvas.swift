@@ -7,6 +7,7 @@ enum AnnotationEndpoint {
     case end
     case third
     case fourth
+    case pathPoint(Int)
 }
 
 enum CropDragTarget {
@@ -88,6 +89,8 @@ struct EditorCanvas: View {
     @State private var cropDragTarget: CropDragTarget?
     @State private var cropDragStartPoint: CGPoint?
     @State private var cropDragStartRect: CGRect?
+    @State private var traceBitmap: NSBitmapImageRep?
+    @State private var traceImageSize: CGSize = .zero
     @FocusState private var isCanvasFocused: Bool
 
     var body: some View {
@@ -153,8 +156,9 @@ struct EditorCanvas: View {
                                             || $0.type == .line
                                             || $0.type == .rectangle
                                             || $0.type == .ellipse
-                                            || $0.type == .pen
                                             || $0.type == .region
+                                            || $0.type == .trace
+                                            || $0.type == .pen
                                             || $0.type == .text
                                             || $0.type == .blur
                                     },
@@ -299,7 +303,7 @@ struct EditorCanvas: View {
     private var annotationPreview: MSAnnotation? {
         guard let annotation = appState.inProgressAnnotation else { return nil }
         switch annotation.type {
-        case .arrow, .line, .rectangle, .ellipse, .pen, .region, .blur:
+        case .arrow, .line, .rectangle, .ellipse, .region, .trace, .pen, .blur:
             return annotation
         default:
             return nil
@@ -347,6 +351,10 @@ struct EditorCanvas: View {
                     return
                 }
 
+                if appState.selectedTool == .trace {
+                    return
+                }
+
                 if appState.selectedTool == .select {
                     if lastDragPoint == nil {
                         if let endpoint = endpointHitTest(imagePoint, scale: scale) {
@@ -370,6 +378,8 @@ struct EditorCanvas: View {
                             appState.updateSelectedAngleThirdPoint(to: imagePoint)
                         case .fourth:
                             appState.updateSelectedAngleFourthPoint(to: imagePoint)
+                        case .pathPoint(let index):
+                            appState.updateSelectedPathPoint(at: index, to: imagePoint)
                         }
                         self.lastDragPoint = imagePoint
                         return
@@ -407,6 +417,10 @@ struct EditorCanvas: View {
                     cropDragTarget = nil
                     cropDragStartPoint = nil
                     cropDragStartRect = nil
+                    if appState.selectedTool == .trace, !appState.isTraceInProgress {
+                        traceBitmap = nil
+                        traceImageSize = .zero
+                    }
                 }
 
                 if appState.selectedTool == .crop {
@@ -433,6 +447,20 @@ struct EditorCanvas: View {
                     return
                 }
 
+                if appState.selectedTool == .trace {
+                    let imagePoint = clampedImagePoint(
+                        value.location,
+                        scale: scale,
+                        imageSize: imageSize
+                    )
+                    appState.addTracePoint(snappedTracePoint(near: imagePoint))
+                    if !appState.isTraceInProgress {
+                        traceBitmap = nil
+                        traceImageSize = .zero
+                    }
+                    return
+                }
+
                 if appState.selectedTool == .select {
                     if draggedEndpoint != nil {
                         appState.finishEditingSelectedAnnotationEndpoint()
@@ -450,6 +478,10 @@ struct EditorCanvas: View {
     }
 
     private func drawingPoint(for point: CGPoint) -> CGPoint {
+        if appState.selectedTool == .trace {
+            return snappedTracePoint(near: point)
+        }
+
         guard (appState.selectedTool == .ellipse || appState.selectedTool == .rectangle),
               NSEvent.modifierFlags.contains(.shift),
               let start = appState.inProgressAnnotation?.start else {
@@ -571,6 +603,15 @@ struct EditorCanvas: View {
         guard annotation.type != .pen else { return nil }
         let tolerance = max(8, 10 / max(scale, 0.01))
 
+        if annotation.type == .trace || annotation.type == .region {
+            for (index, pathPoint) in annotation.points.enumerated().reversed() {
+                if hypot(point.x - pathPoint.x, point.y - pathPoint.y) <= tolerance {
+                    return .pathPoint(index)
+                }
+            }
+            return nil
+        }
+
         if hypot(point.x - annotation.start.x, point.y - annotation.start.y) <= tolerance {
             return .start
         }
@@ -612,7 +653,7 @@ struct EditorCanvas: View {
                     return annotation.id
                 }
 
-            case .pen, .region:
+            case .pen, .region, .trace:
                 if freehandHitTest(point, annotation: annotation) {
                     return annotation.id
                 }
@@ -783,6 +824,91 @@ struct EditorCanvas: View {
         }
 
         appState.updateSampledColor(colour)
+    }
+
+    private func snappedTracePoint(near point: CGPoint) -> CGPoint {
+        if traceBitmap == nil || !appState.isTraceInProgress {
+            prepareTraceBitmap()
+        }
+
+        guard let bitmap = traceBitmap else { return point }
+
+        let searchRadius = 24
+        let originX = Int(point.x.rounded())
+        let originY = Int(point.y.rounded())
+        var bestPoint = point
+        var bestScore = 0.0
+
+        for y in (originY - searchRadius)...(originY + searchRadius) {
+            for x in (originX - searchRadius)...(originX + searchRadius) {
+                let candidate = CGPoint(x: CGFloat(x), y: CGFloat(y))
+                let distance = hypot(candidate.x - point.x, candidate.y - point.y)
+                guard distance <= CGFloat(searchRadius),
+                      x >= 1,
+                      y >= 1,
+                      x < Int(traceImageSize.width) - 1,
+                      y < Int(traceImageSize.height) - 1 else {
+                    continue
+                }
+
+                let edgeScore = edgeStrength(at: candidate, imageSize: traceImageSize, bitmap: bitmap)
+                let score = edgeScore - Double(distance / CGFloat(searchRadius)) * 0.015
+                if score > bestScore {
+                    bestScore = score
+                    bestPoint = candidate
+                }
+            }
+        }
+
+        return bestScore >= 0.025 ? bestPoint : point
+    }
+
+    private func prepareTraceBitmap() {
+        guard let imageDocument = appState.imageDocument else { return }
+
+        let image = ImageRenderer.render(document: imageDocument)
+        guard let tiff = image.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiff) else {
+            return
+        }
+
+        traceBitmap = bitmap
+        traceImageSize = image.size
+    }
+
+    private func edgeStrength(at point: CGPoint, imageSize: CGSize, bitmap: NSBitmapImageRep) -> Double {
+        guard let topLeft = luminance(at: CGPoint(x: point.x - 1, y: point.y - 1), imageSize: imageSize, bitmap: bitmap),
+              let top = luminance(at: CGPoint(x: point.x, y: point.y - 1), imageSize: imageSize, bitmap: bitmap),
+              let topRight = luminance(at: CGPoint(x: point.x + 1, y: point.y - 1), imageSize: imageSize, bitmap: bitmap),
+              let left = luminance(at: CGPoint(x: point.x - 1, y: point.y), imageSize: imageSize, bitmap: bitmap),
+              let right = luminance(at: CGPoint(x: point.x + 1, y: point.y), imageSize: imageSize, bitmap: bitmap),
+              let bottomLeft = luminance(at: CGPoint(x: point.x - 1, y: point.y + 1), imageSize: imageSize, bitmap: bitmap),
+              let bottom = luminance(at: CGPoint(x: point.x, y: point.y + 1), imageSize: imageSize, bitmap: bitmap),
+              let bottomRight = luminance(at: CGPoint(x: point.x + 1, y: point.y + 1), imageSize: imageSize, bitmap: bitmap) else {
+            return 0
+        }
+
+        let horizontal = -topLeft - 2 * left - bottomLeft + topRight + 2 * right + bottomRight
+        let vertical = -topLeft - 2 * top - topRight + bottomLeft + 2 * bottom + bottomRight
+        return hypot(horizontal, vertical) / 4
+    }
+
+    private func luminance(at point: CGPoint, imageSize: CGSize, bitmap: NSBitmapImageRep) -> Double? {
+        guard let colour = colourAtImagePoint(point, imageSize: imageSize, bitmap: bitmap)?.usingColorSpace(.deviceRGB) else {
+            return nil
+        }
+
+        return 0.2126 * colour.redComponent + 0.7152 * colour.greenComponent + 0.0722 * colour.blueComponent
+    }
+
+    private func colourAtImagePoint(_ point: CGPoint, imageSize: CGSize, bitmap: NSBitmapImageRep) -> NSColor? {
+        let normalizedX = min(max(point.x / max(imageSize.width, 1), 0), 1)
+        let normalizedY = min(max(point.y / max(imageSize.height, 1), 0), 1)
+        let pixelX = min(max(Int(normalizedX * CGFloat(bitmap.pixelsWide)), 0), bitmap.pixelsWide - 1)
+        let pixelYFromTop = min(max(Int(normalizedY * CGFloat(bitmap.pixelsHigh)), 0), bitmap.pixelsHigh - 1)
+        let pixelY = bitmap.pixelsHigh - 1 - pixelYFromTop
+
+        return bitmap.colorAt(x: pixelX, y: pixelY)
     }
 
     private func distanceFromPoint(_ point: CGPoint, toSegmentFrom start: CGPoint, to end: CGPoint) -> CGFloat {

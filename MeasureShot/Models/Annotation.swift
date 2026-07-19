@@ -12,6 +12,7 @@ enum MSAnnotationType: String, Codable, CaseIterable, Sendable {
     case ellipse
     case pen
     case region
+    case trace
     case text
     case blur
 }

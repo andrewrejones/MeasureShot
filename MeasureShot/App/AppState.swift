@@ -804,6 +804,10 @@ final class AppState {
         return annotations.first { $0.id == selectedAnnotationID }
     }
 
+    var isTraceInProgress: Bool {
+        inProgressAnnotation?.type == .trace
+    }
+
     func annotationType(for tool: MSToolType) -> MSAnnotationType? {
         switch tool {
         case .arrow:
@@ -816,6 +820,8 @@ final class AppState {
             return .pen
         case .region:
             return .region
+        case .trace:
+            return .trace
         case .measure:
             return .measurement
         case .calibrate:
@@ -835,7 +841,7 @@ final class AppState {
 
     func canDrawWithSelectedTool() -> Bool {
         switch selectedTool {
-        case .measure, .calibrate, .angle, .parallelAngle, .arrow, .rectangle, .ellipse, .pen, .region, .blur:
+        case .measure, .calibrate, .angle, .parallelAngle, .arrow, .rectangle, .ellipse, .region, .trace, .pen, .blur:
             return true
         case .select, .text, .crop, .colourPicker, .sideBySide:
             return false
@@ -918,13 +924,13 @@ final class AppState {
             return
         }
 
-        if type == .region {
-            var annotation = MSAnnotation(type: .region, start: point, end: point)
+        if type == .region || type == .trace {
+            var annotation = MSAnnotation(type: type, start: point, end: point)
             annotation.points = [point]
             annotation.stroke.color = colorData(from: annotationColor)
             annotation.stroke.lineWidth = annotationLineWidth
             inProgressAnnotation = annotation
-            statusMessage = "Tracing region"
+            statusMessage = type == .trace ? "Tracing edge" : "Tracing region"
             return
         }
 
@@ -960,7 +966,7 @@ final class AppState {
             } else {
                 annotation.points = [point]
             }
-        } else if annotation.type == .pen || annotation.type == .region {
+        } else if annotation.type == .pen || annotation.type == .region || annotation.type == .trace {
             annotation.end = point
 
             if let lastPoint = annotation.points.last {
@@ -976,6 +982,51 @@ final class AppState {
         }
 
         inProgressAnnotation = annotation
+    }
+
+    func addTracePoint(_ point: CGPoint) {
+        guard inProgressAnnotation?.type == .trace else {
+            beginAnnotation(type: .trace, at: point)
+            statusMessage = "Trace point 1"
+            return
+        }
+
+        guard var annotation = inProgressAnnotation else { return }
+        if let lastPoint = annotation.points.last {
+            let distance = hypot(point.x - lastPoint.x, point.y - lastPoint.y)
+            guard distance >= max(2, annotation.stroke.lineWidth * 0.5) else {
+                statusMessage = "Trace point too close"
+                return
+            }
+        }
+
+        annotation.end = point
+        annotation.points.append(point)
+        inProgressAnnotation = annotation
+
+        if shouldCloseTrace(annotation) {
+            finishAnnotation()
+            selectedTool = .select
+        } else {
+            statusMessage = "Trace point \(annotation.points.count). Click near the start to close."
+        }
+    }
+
+    func finishTrace() {
+        guard inProgressAnnotation?.type == .trace else { return }
+        guard (inProgressAnnotation?.points.count ?? 0) >= 2 else {
+            cancelTrace()
+            return
+        }
+
+        finishAnnotation()
+        selectedTool = .select
+    }
+
+    func cancelTrace() {
+        guard inProgressAnnotation?.type == .trace else { return }
+        inProgressAnnotation = nil
+        statusMessage = "Trace cancelled"
     }
 
     func finishAnnotation() {
@@ -999,7 +1050,7 @@ final class AppState {
             return
         }
 
-        if annotation.type == .pen || annotation.type == .region {
+        if annotation.type == .pen || annotation.type == .region || annotation.type == .trace {
             guard !annotation.points.isEmpty else {
                 inProgressAnnotation = nil
                 return
@@ -1009,11 +1060,24 @@ final class AppState {
                 annotation.points.append(annotation.points[0])
             }
 
+            if annotation.type == .trace, shouldCloseTrace(annotation) {
+                annotation.type = .region
+                annotation.points[annotation.points.count - 1] = annotation.points[0]
+                annotation.end = annotation.points[0]
+            }
+
             recordUndoState()
             annotations.append(annotation)
             selectedAnnotationID = annotation.id
             inProgressAnnotation = nil
-            statusMessage = annotation.type == .region ? "Added measured region" : "Added pen stroke"
+            switch annotation.type {
+            case .region:
+                statusMessage = "Added measured region"
+            case .trace:
+                statusMessage = "Added traced edge"
+            default:
+                statusMessage = "Added pen stroke"
+            }
             return
         }
 
@@ -1245,6 +1309,16 @@ final class AppState {
         }
 
         applyCalibration(from: selectedAnnotation)
+    }
+
+    private func shouldCloseTrace(_ annotation: MSAnnotation) -> Bool {
+        guard annotation.points.count >= 4,
+              let firstPoint = annotation.points.first,
+              let lastPoint = annotation.points.last else {
+            return false
+        }
+
+        return hypot(lastPoint.x - firstPoint.x, lastPoint.y - firstPoint.y) <= max(12, annotation.stroke.lineWidth * 3)
     }
 
     func clearCalibration() {
@@ -1930,7 +2004,7 @@ final class AppState {
                 CGPoint(x: $0.x + delta.width, y: $0.y + delta.height)
             }
         }
-        if annotations[index].type == .pen || annotations[index].type == .region {
+        if annotations[index].type == .pen || annotations[index].type == .region || annotations[index].type == .trace {
             annotations[index].points = annotations[index].points.map {
                 CGPoint(x: $0.x + delta.width, y: $0.y + delta.height)
             }
@@ -1998,6 +2072,33 @@ final class AppState {
         }
 
         annotations[index].fourthPoint = point
+    }
+
+    func updateSelectedPathPoint(at pointIndex: Int, to point: CGPoint) {
+        guard let selectedWorkspace,
+              let selectedAnnotationID,
+              let annotationIndex = annotations.firstIndex(where: { $0.id == selectedAnnotationID }),
+              annotations[annotationIndex].type == .trace || annotations[annotationIndex].type == .region,
+              annotations[annotationIndex].points.indices.contains(pointIndex) else {
+            return
+        }
+
+        if selectedWorkspace.lastEndpointEditUndoState == nil {
+            selectedWorkspace.lastEndpointEditUndoState = currentUndoState()
+        }
+
+        annotations[annotationIndex].points[pointIndex] = point
+        if annotations[annotationIndex].type == .region,
+           annotations[annotationIndex].points.count > 2 {
+            if pointIndex == 0 {
+                annotations[annotationIndex].points[annotations[annotationIndex].points.count - 1] = point
+            } else if pointIndex == annotations[annotationIndex].points.count - 1 {
+                annotations[annotationIndex].points[0] = point
+            }
+        }
+
+        annotations[annotationIndex].start = annotations[annotationIndex].points.first ?? point
+        annotations[annotationIndex].end = annotations[annotationIndex].points.last ?? point
     }
 
     func finishEditingSelectedAnnotationEndpoint() {
