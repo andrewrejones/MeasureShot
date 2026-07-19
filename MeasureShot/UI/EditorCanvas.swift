@@ -142,7 +142,7 @@ struct EditorCanvas: View {
                                     scale: effectiveScale,
                                     calibration: appState.calibration,
                                     outputUnit: appState.outputMeasurementUnit,
-                                    regionTitleProvider: { appState.regionTitle(for: $0) }
+                                    regionTitleProvider: { appState.compactRegionTitle(for: $0) }
                                 )
                             }
 
@@ -163,7 +163,7 @@ struct EditorCanvas: View {
                                     scale: effectiveScale,
                                     calibration: appState.calibration,
                                     outputUnit: appState.outputMeasurementUnit,
-                                    regionTitleProvider: { appState.regionTitle(for: $0) }
+                                    regionTitleProvider: { appState.compactRegionTitle(for: $0) }
                                 )
                             }
 
@@ -450,7 +450,7 @@ struct EditorCanvas: View {
     }
 
     private func drawingPoint(for point: CGPoint) -> CGPoint {
-        guard appState.selectedTool == .ellipse,
+        guard (appState.selectedTool == .ellipse || appState.selectedTool == .rectangle),
               NSEvent.modifierFlags.contains(.shift),
               let start = appState.inProgressAnnotation?.start else {
             return point

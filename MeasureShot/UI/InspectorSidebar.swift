@@ -17,14 +17,27 @@ private let annotationColourPresets: [(title: String, color: Color)] = [
     ("Blue", .blue)
 ]
 
+private struct ComputationMetricChoice: Identifiable, Hashable {
+    let id: String
+    let title: String
+}
+
 struct InspectorSidebar: View {
     @Environment(AppState.self) private var appState
     @AppStorage("inspector.imageSectionExpanded") private var isImageSectionExpanded = true
     @AppStorage("inspector.appearanceSectionExpanded") private var isAppearanceSectionExpanded = true
     @AppStorage("inspector.layersSectionExpanded") private var isLayersSectionExpanded = true
+    @AppStorage("inspector.equationBuilderExpanded") private var isEquationBuilderExpanded = true
+    @AppStorage("inspector.exportHistoryExpanded") private var isExportHistoryExpanded = false
     @State private var comparisonFirstID: UUID?
     @State private var comparisonSecondID: UUID?
     @State private var comparisonResult: String?
+    @State private var computationName = "Custom computation"
+    @State private var computationExpression = ""
+    @State private var selectedValueOneSourceID: String?
+    @State private var selectedValueOneMetricID = "area"
+    @State private var selectedValueTwoSourceID: String?
+    @State private var selectedValueTwoMetricID = "area"
 
     private var shouldShowMeasurementPanel: Bool {
         appState.selectedTool == .calibrate
@@ -54,6 +67,10 @@ struct InspectorSidebar: View {
 
     private var measuredRegions: [MSAnnotation] {
         appState.measuredRegions()
+    }
+
+    private var measuredItems: [MSAnnotation] {
+        appState.measuredItems()
     }
 
     private var textSection: some View {
@@ -190,19 +207,17 @@ struct InspectorSidebar: View {
                 activeToolSection
                 instructionsSection
 
-                if !measuredRegions.isEmpty {
-                    measuredRegionsSection
+                if !measuredItems.isEmpty {
+                    measuredItemsSection
                 }
 
                 if measuredRegions.count >= 2 {
                     regionComparisonSection
                 }
 
-                if appState.imageDocument != nil {
-                    imageAdjustmentsSection
+                if !appState.computationVariables().isEmpty {
+                    computationBuilderSection
                 }
-
-                appearanceSection
 
                 if shouldShowTextPanel {
                     textSection
@@ -215,6 +230,12 @@ struct InspectorSidebar: View {
                 if shouldShowColourPickerPanel {
                     colourPickerSection
                 }
+
+                if appState.imageDocument != nil {
+                    imageAdjustmentsSection
+                }
+
+                appearanceSection
 
                 if shouldShowMeasurementPanel {
                     measurementSection
@@ -247,6 +268,15 @@ struct InspectorSidebar: View {
                     Spacer()
                     Text(appState.sampledHex)
                         .font(.system(.body, design: .monospaced))
+                        .textSelection(.enabled)
+
+                    Button {
+                        appState.copySampledHex()
+                    } label: {
+                        Image(systemName: "doc.on.doc")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Copy HEX")
                 }
 
                 HStack {
@@ -276,13 +306,13 @@ struct InspectorSidebar: View {
         }
     }
 
-    private var measuredRegionsSection: some View {
-        GroupBox("Measured Regions") {
+    private var measuredItemsSection: some View {
+        GroupBox("Measured Items") {
             VStack(alignment: .leading, spacing: 10) {
-                ForEach(Array(measuredRegions.enumerated()), id: \.element.id) { _, annotation in
-                    regionMeasurementRow(annotation)
+                ForEach(Array(measuredItems.enumerated()), id: \.element.id) { _, annotation in
+                    measuredItemRow(annotation)
 
-                    if annotation.id != measuredRegions.last?.id {
+                    if annotation.id != measuredItems.last?.id {
                         Divider()
                     }
                 }
@@ -291,14 +321,19 @@ struct InspectorSidebar: View {
         }
     }
 
-    private func regionMeasurementRow(_ annotation: MSAnnotation) -> some View {
+    private func measuredItemRow(_ annotation: MSAnnotation) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
+                Text("\(appState.compactMeasuredItemTitle(for: annotation)):")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(minWidth: 42, alignment: .leading)
+
                 TextField(
-                    "Region name",
+                    "Measurement name",
                     text: Binding(
-                        get: { appState.regionTitle(for: annotation) },
-                        set: { appState.updateRegionTitle(id: annotation.id, title: $0) }
+                        get: { appState.measuredItemTitle(for: annotation) },
+                        set: { appState.updateMeasuredItemTitle(id: annotation.id, title: $0) }
                     )
                 )
                 .textFieldStyle(.roundedBorder)
@@ -313,7 +348,7 @@ struct InspectorSidebar: View {
                     Image(systemName: appState.selectedAnnotationID == annotation.id ? "checkmark.circle.fill" : "scope")
                 }
                 .buttonStyle(.borderless)
-                .help("Select \(appState.regionTitle(for: annotation))")
+                .help("Select \(appState.measuredItemTitle(for: annotation))")
 
                 Button(role: .destructive) {
                     appState.deleteAnnotation(id: annotation.id)
@@ -321,40 +356,44 @@ struct InspectorSidebar: View {
                     Image(systemName: "trash")
                 }
                 .buttonStyle(.borderless)
-                .help("Delete \(appState.regionTitle(for: annotation))")
+                .help("Delete \(appState.measuredItemTitle(for: annotation))")
             }
 
-            ForEach(
-                annotation.regionMeasurementLines(
-                    calibration: appState.calibration,
-                    outputUnit: appState.outputMeasurementUnit
-                ),
-                id: \.self
-            ) { line in
-                Text(line)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+            if annotation.isMeasuredRegion {
+                ForEach(
+                    annotation.regionMeasurementLines(
+                        calibration: appState.calibration,
+                        outputUnit: appState.outputMeasurementUnit
+                    ),
+                    id: \.self
+                ) { line in
+                    measuredItemDetail(line)
+                }
 
-            if let averageColor = appState.averageColor(for: annotation) {
-                Divider()
+                if let averageColor = appState.averageColor(for: annotation) {
+                    Divider()
 
-                Text("Average HEX: \(averageColor.hex)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
+                    measuredItemDetail("Average HEX: \(averageColor.hex)")
+                        .textSelection(.enabled)
 
-                Text("Average RGB: \(averageColor.rgb)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
+                    measuredItemDetail("Average RGB: \(averageColor.rgb)")
+                        .textSelection(.enabled)
+                }
+            } else {
+                measuredItemDetail(appState.measurementText(for: annotation))
             }
         }
     }
 
+    private func measuredItemDetail(_ text: String) -> some View {
+        Text(text)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
     private var exportHistorySection: some View {
-        GroupBox("Export History") {
+        DisclosureGroup(isExpanded: $isExportHistoryExpanded) {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
                     Text("Recent Exports")
@@ -373,9 +412,17 @@ struct InspectorSidebar: View {
                         Divider()
                     }
                 }
-
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.top, 8)
+        } label: {
+            HStack {
+                Label("Export History", systemImage: "clock.arrow.circlepath")
+                Spacer()
+                Text("\(appState.exportHistory.count)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 
@@ -616,17 +663,17 @@ struct InspectorSidebar: View {
     }
 
     private var regionComparisonSection: some View {
-        GroupBox("Compare Regions") {
+        GroupBox("Quick Computations") {
             VStack(alignment: .leading, spacing: 10) {
                 Picker("First", selection: comparisonFirstBinding) {
                     ForEach(measuredRegions) { annotation in
-                        Text(appState.regionTitle(for: annotation)).tag(Optional(annotation.id))
+                        Text(appState.inspectorRegionTitle(for: annotation)).tag(Optional(annotation.id))
                     }
                 }
 
                 Picker("Second", selection: comparisonSecondBinding) {
                     ForEach(measuredRegions) { annotation in
-                        Text(appState.regionTitle(for: annotation)).tag(Optional(annotation.id))
+                        Text(appState.inspectorRegionTitle(for: annotation)).tag(Optional(annotation.id))
                     }
                 }
 
@@ -691,6 +738,256 @@ struct InspectorSidebar: View {
                     ?? measuredRegions.first { $0.id != (comparisonFirstID ?? measuredRegions.first?.id) }?.id
             },
             set: { comparisonSecondID = $0 }
+        )
+    }
+
+    private var computationVariables: [MSComputationVariable] {
+        appState.computationVariables()
+    }
+
+    private var computationBuilderSection: some View {
+        DisclosureGroup(isExpanded: $isEquationBuilderExpanded) {
+            VStack(alignment: .leading, spacing: 10) {
+                TextField("Result name", text: $computationName)
+                    .textFieldStyle(.roundedBorder)
+
+                computationValuePicker(
+                    title: "Value 1",
+                    sourceID: $selectedValueOneSourceID,
+                    metricID: $selectedValueOneMetricID
+                )
+
+                computationValuePicker(
+                    title: "Value 2",
+                    sourceID: $selectedValueTwoSourceID,
+                    metricID: $selectedValueTwoMetricID
+                )
+
+                TextField("Equation", text: $computationExpression, axis: .vertical)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(.body, design: .monospaced))
+                    .lineLimit(2...4)
+
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 6), count: 4), spacing: 6) {
+                    ForEach(["+", "-", "×", "÷", "(", ")", "0.5", "100"], id: \.self) { token in
+                        Button(token) {
+                            appendComputationToken(token)
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                }
+
+                computationPreview
+
+                HStack {
+                    Button("Save Result") {
+                        saveCurrentComputation()
+                    }
+                    .disabled(currentComputationValue == nil)
+
+                    Button("Clear") {
+                        computationExpression = ""
+                    }
+                    .disabled(computationExpression.isEmpty)
+                }
+
+                if !appState.computationResults.isEmpty {
+                    Divider()
+
+                    HStack {
+                        Text("Saved")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button("Clear All") {
+                            appState.clearComputationResults()
+                        }
+                        .font(.caption)
+                    }
+
+                    ForEach(appState.computationResults) { result in
+                        HStack(alignment: .top, spacing: 8) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("\(result.name): \(result.formattedValue)")
+                                    .font(.caption.weight(.semibold))
+                                Text(result.expression)
+                                    .font(.caption2.monospaced())
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+
+                            Spacer()
+
+                            Button(role: .destructive) {
+                                appState.deleteComputationResult(id: result.id)
+                            } label: {
+                                Image(systemName: "trash")
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.top, 8)
+            .onAppear {
+                ensureComputationValueSelections()
+            }
+            .onChange(of: computationVariables.map(\.id)) {
+                ensureComputationValueSelections()
+            }
+        } label: {
+            Label("Equation Builder", systemImage: "function")
+        }
+    }
+
+    private func computationValuePicker(
+        title: String,
+        sourceID: Binding<String?>,
+        metricID: Binding<String>
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+
+            Picker("Source", selection: sourceID) {
+                ForEach(computationSourceChoices) { source in
+                    Text(source.title).tag(Optional(source.id))
+                }
+            }
+
+            Picker("Measurement", selection: metricID) {
+                ForEach(computationMetricChoices(for: sourceID.wrappedValue)) { metric in
+                    Text(metric.title).tag(metric.id)
+                }
+            }
+
+            Button("Insert \(title)") {
+                insertComputationValue(sourceID: sourceID.wrappedValue, metricID: metricID.wrappedValue)
+            }
+            .disabled(computationVariableID(sourceID: sourceID.wrappedValue, metricID: metricID.wrappedValue) == nil)
+        }
+    }
+
+    @ViewBuilder
+    private var computationPreview: some View {
+        if computationExpression.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            Text("Choose values and operators to build a calculation.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        } else if let currentComputationValue {
+            Text(String(format: "Live result: %.4f", currentComputationValue))
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.primary)
+                .textSelection(.enabled)
+        } else if let error = currentComputationError {
+            Text(error)
+                .font(.caption)
+                .foregroundStyle(.red)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var currentComputationValue: Double? {
+        try? MSFormulaEvaluator.evaluate(
+            expression: computationExpression,
+            variables: computationVariableValues
+        )
+    }
+
+    private var currentComputationError: String? {
+        do {
+            _ = try MSFormulaEvaluator.evaluate(
+                expression: computationExpression,
+                variables: computationVariableValues
+            )
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
+    }
+
+    private var computationVariableValues: [String: Double] {
+        Dictionary(uniqueKeysWithValues: computationVariables.map { ($0.id, $0.value) })
+    }
+
+    private var computationSourceChoices: [ComputationMetricChoice] {
+        var seen = Set<String>()
+        return computationVariables.compactMap { variable in
+            guard !seen.contains(variable.sourceID) else { return nil }
+            seen.insert(variable.sourceID)
+            return ComputationMetricChoice(id: variable.sourceID, title: variable.sourceTitle)
+        }
+    }
+
+    private func ensureComputationValueSelections() {
+        let sourceIDs = computationSourceChoices.map(\.id)
+        guard !sourceIDs.isEmpty else {
+            selectedValueOneSourceID = nil
+            selectedValueTwoSourceID = nil
+            return
+        }
+
+        if selectedValueOneSourceID == nil || !sourceIDs.contains(selectedValueOneSourceID!) {
+            selectedValueOneSourceID = sourceIDs[0]
+        }
+
+        if selectedValueTwoSourceID == nil || !sourceIDs.contains(selectedValueTwoSourceID!) {
+            selectedValueTwoSourceID = sourceIDs.count > 1 ? sourceIDs[1] : sourceIDs[0]
+        }
+
+        selectedValueOneMetricID = validMetricID(selectedValueOneMetricID, for: selectedValueOneSourceID)
+        selectedValueTwoMetricID = validMetricID(selectedValueTwoMetricID, for: selectedValueTwoSourceID)
+    }
+
+    private func computationMetricChoices(for sourceID: String?) -> [ComputationMetricChoice] {
+        guard let sourceID else { return [] }
+
+        return computationVariables
+            .filter { $0.sourceID == sourceID }
+            .map { variable in
+                ComputationMetricChoice(id: variable.metricID, title: "\(variable.metricTitle) (\(variable.unit))")
+            }
+    }
+
+    private func validMetricID(_ metricID: String, for sourceID: String?) -> String {
+        let choices = computationMetricChoices(for: sourceID)
+        if choices.contains(where: { $0.id == metricID }) {
+            return metricID
+        }
+
+        return choices.first?.id ?? "area"
+    }
+
+    private func insertComputationValue(sourceID: String?, metricID: String) {
+        guard let variableID = computationVariableID(sourceID: sourceID, metricID: metricID) else { return }
+        appendComputationToken(variableID)
+    }
+
+    private func computationVariableID(sourceID: String?, metricID: String) -> String? {
+        guard let sourceID else { return nil }
+        let validMetricID = validMetricID(metricID, for: sourceID)
+        return computationVariables.first {
+            $0.sourceID == sourceID && $0.metricID == validMetricID
+        }?.id
+    }
+
+    private func appendComputationToken(_ token: String) {
+        if computationExpression.isEmpty {
+            computationExpression = token
+        } else {
+            computationExpression += " \(token)"
+        }
+    }
+
+    private func saveCurrentComputation() {
+        guard let value = currentComputationValue else { return }
+        appState.addComputationResult(
+            name: computationName,
+            expression: computationExpression,
+            value: value
         )
     }
 
@@ -929,7 +1226,7 @@ struct InspectorSidebar: View {
         case .arrow:
             return "Drag from the arrow tail to its tip."
         case .rectangle:
-            return "Drag diagonally to draw a rectangle."
+            return "Drag diagonally to draw a rectangle. Hold Shift while dragging to make a perfect square."
         case .ellipse:
             return "Drag diagonally to draw an ellipse. Hold Shift while dragging to make a perfect circle."
         case .pen:
@@ -944,6 +1241,8 @@ struct InspectorSidebar: View {
             return "Drag a crop edge or corner to resize it, or drag elsewhere on the image to draw a new crop box. Release to crop."
         case .colourPicker:
             return "Move over the image and click to copy the sampled colour value."
+        case .sideBySide:
+            return "Compare two screenshot tabs side by side. Select a pane to make that image active for editing and measurements."
         }
     }
 

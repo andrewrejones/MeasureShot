@@ -27,9 +27,16 @@ struct EditorView: View {
                     .environment(appState)
                     .frame(minWidth: 150, idealWidth: 170, maxWidth: 210)
 
-                EditorCanvas()
-                    .environment(appState)
-                    .frame(minWidth: 500, maxWidth: .infinity, maxHeight: .infinity)
+                Group {
+                    if appState.selectedTool == .sideBySide {
+                        SideBySideComparisonView()
+                            .environment(appState)
+                    } else {
+                        EditorCanvas()
+                            .environment(appState)
+                    }
+                }
+                .frame(minWidth: 500, maxWidth: .infinity, maxHeight: .infinity)
 
                 InspectorSidebar()
                     .environment(appState)

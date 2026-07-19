@@ -158,8 +158,9 @@ enum ExportRenderer {
         outputUnit: MSMeasurementUnit,
         computationLines: [String] = []
     ) -> String {
+        let measuredRegions = annotations.filter { $0.isMeasuredRegion }
         let rows = annotations.enumerated().map { index, annotation in
-            let name = annotation.title?.isEmpty == false ? annotation.title! : defaultTitle(for: annotation, index: index)
+            let name = legendTitle(for: annotation, annotationIndex: index, measuredRegions: measuredRegions)
             return [
                 name,
                 annotation.type.rawValue,
@@ -210,8 +211,9 @@ enum ExportRenderer {
         calibration: MSCalibration?,
         outputUnit: MSMeasurementUnit
     ) -> [String] {
-        annotations.enumerated().map { index, annotation in
-            let name = annotation.title?.isEmpty == false ? annotation.title! : defaultTitle(for: annotation, index: index)
+        let measuredRegions = annotations.filter { $0.isMeasuredRegion }
+        return annotations.enumerated().map { index, annotation in
+            let name = legendTitle(for: annotation, annotationIndex: index, measuredRegions: measuredRegions)
             let value = annotation.displayValue(calibration: calibration, outputUnit: outputUnit)
             let regionDetails = annotation.regionMeasurementLines(
                 calibration: calibration,
@@ -228,6 +230,24 @@ enum ExportRenderer {
 
             return "\(name)\n\(annotation.type.rawValue)"
         }
+    }
+
+    private static func legendTitle(
+        for annotation: MSAnnotation,
+        annotationIndex: Int,
+        measuredRegions: [MSAnnotation]
+    ) -> String {
+        if annotation.isMeasuredRegion {
+            let compactTitle = regionTitle(for: annotation, measuredRegions: measuredRegions)
+            let fullTitle = annotation.title?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                ? annotation.title!
+                : fullRegionTitle(for: annotation, measuredRegions: measuredRegions)
+            return "\(compactTitle): \(fullTitle)"
+        }
+
+        return annotation.title?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            ? annotation.title!
+            : defaultTitle(for: annotation, index: annotationIndex)
     }
 
     private static func defaultTitle(for annotation: MSAnnotation, index: Int) -> String {
@@ -736,23 +756,41 @@ enum ExportRenderer {
         for annotation: MSAnnotation,
         measuredRegions: [MSAnnotation]
     ) -> String {
-        guard annotation.isMeasuredRegion,
-              let index = measuredRegions.firstIndex(where: { $0.id == annotation.id }) else {
-            return ""
-        }
+        guard annotation.isMeasuredRegion else { return "" }
 
-        let title: String
+        let matchingRegions = measuredRegions.filter { $0.type == annotation.type }
+        let index = matchingRegions.firstIndex { $0.id == annotation.id } ?? 0
+
         switch annotation.type {
         case .rectangle:
-            title = "Rectangle"
+            return "R\(index + 1)"
         case .ellipse:
-            title = "Ellipse"
+            return "E\(index + 1)"
         case .region:
-            title = "Region"
+            return "ROI\(index + 1)"
         default:
-            title = "Shape"
+            return "M\(index + 1)"
         }
+    }
 
-        return "\(title) \(index + 1)"
+    private static func fullRegionTitle(
+        for annotation: MSAnnotation,
+        measuredRegions: [MSAnnotation]
+    ) -> String {
+        guard annotation.isMeasuredRegion else { return "" }
+
+        let matchingRegions = measuredRegions.filter { $0.type == annotation.type }
+        let index = matchingRegions.firstIndex { $0.id == annotation.id } ?? 0
+
+        switch annotation.type {
+        case .rectangle:
+            return "Rectangle \(index + 1)"
+        case .ellipse:
+            return "Ellipse \(index + 1)"
+        case .region:
+            return "Region \(index + 1)"
+        default:
+            return "Shape \(index + 1)"
+        }
     }
 }

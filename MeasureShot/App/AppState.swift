@@ -76,6 +76,11 @@ struct MSAverageColor: Hashable {
     var rgb: String
 }
 
+enum MSSideBySideSlot {
+    case left
+    case right
+}
+
 @Observable
 private final class ScreenshotWorkspace: Identifiable {
     let id: UUID
@@ -92,6 +97,7 @@ private final class ScreenshotWorkspace: Identifiable {
     var pendingImageAdjustmentUndoState: AppUndoState?
     var lastMoveUndoState: AppUndoState?
     var lastEndpointEditUndoState: AppUndoState?
+    var computationResults: [MSComputationResult] = []
 
     init(document: ImageDocument) {
         self.id = document.id
@@ -138,10 +144,13 @@ final class AppState {
         var isAnnotationLayerVisible: Bool
         var isMeasurementLayerVisible: Bool
         var isGuideLayerVisible: Bool
+        var computationResults: [MSComputationResult]?
     }
 
     private var screenshotWorkspaces: [ScreenshotWorkspace] = []
     var selectedScreenshotID: UUID?
+    var sideBySideLeftScreenshotID: UUID?
+    var sideBySideRightScreenshotID: UUID?
 
     var screenshotTabs: [MSScreenshotTabSummary] {
         screenshotWorkspaces.map {
@@ -233,6 +242,10 @@ final class AppState {
     var sampledHex: String = "#000000"
     var sampledRGB: String = "0, 0, 0"
     var latestComparisonResult: String?
+    var computationResults: [MSComputationResult] {
+        get { selectedWorkspace?.computationResults ?? [] }
+        set { selectedWorkspace?.computationResults = newValue }
+    }
 
     var defaultText = "Double-click to edit"
     var defaultFontSize: CGFloat = 18
@@ -274,6 +287,126 @@ final class AppState {
     }
 
     func startCapture() {
+        captureScreenshot { [weak self] image in
+            self?.addScreenshot(image: image)
+            self?.statusMessage = "Capture complete"
+        }
+    }
+
+    func prepareSideBySideComparison() {
+        if sideBySideLeftScreenshotID == nil || !hasScreenshot(id: sideBySideLeftScreenshotID) {
+            sideBySideLeftScreenshotID = selectedScreenshotID
+        }
+
+        if sideBySideRightScreenshotID == nil || !hasScreenshot(id: sideBySideRightScreenshotID) {
+            sideBySideRightScreenshotID = screenshotWorkspaces.first {
+                $0.id != sideBySideLeftScreenshotID
+            }?.id
+        }
+
+        selectedTool = .sideBySide
+        statusMessage = "Side-by-side comparison"
+    }
+
+    func selectSideBySideSlot(_ slot: MSSideBySideSlot) {
+        switch slot {
+        case .left:
+            if let sideBySideLeftScreenshotID {
+                selectScreenshotTab(id: sideBySideLeftScreenshotID)
+            }
+        case .right:
+            if let sideBySideRightScreenshotID {
+                selectScreenshotTab(id: sideBySideRightScreenshotID)
+            }
+        }
+        selectedTool = .sideBySide
+    }
+
+    func captureSideBySideImage(for slot: MSSideBySideSlot) {
+        captureScreenshot { [weak self] image in
+            guard let self else { return }
+
+            let id = self.addScreenshot(image: image, title: self.defaultSideBySideTitle(for: slot))
+            self.setSideBySideScreenshot(id: id, for: slot)
+            self.selectedTool = .sideBySide
+            self.statusMessage = "Added comparison image"
+        }
+    }
+
+    func insertSideBySideImage(for slot: MSSideBySideSlot) {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.image]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+
+        let completion: (NSApplication.ModalResponse) -> Void = { [weak self, panel] response in
+            guard response == .OK,
+                  let url = panel.url,
+                  let image = NSImage(contentsOf: url) else {
+                return
+            }
+
+            Task { @MainActor in
+                guard let self else { return }
+
+                let id = self.addScreenshot(
+                    image: image,
+                    title: url.deletingPathExtension().lastPathComponent
+                )
+                self.setSideBySideScreenshot(id: id, for: slot)
+                self.selectedTool = .sideBySide
+                self.statusMessage = "Inserted comparison image"
+            }
+        }
+
+        if let window = NSApplication.shared.keyWindow ?? NSApplication.shared.mainWindow {
+            panel.beginSheetModal(for: window, completionHandler: completion)
+        } else {
+            panel.begin(completionHandler: completion)
+        }
+    }
+
+    func sideBySideTitle(for slot: MSSideBySideSlot) -> String {
+        guard let workspace = sideBySideWorkspace(for: slot) else {
+            return slot == .left ? "Left Image" : "Right Image"
+        }
+
+        return workspace.document.title
+    }
+
+    func sideBySideRenderedImage(for slot: MSSideBySideSlot) -> NSImage? {
+        guard let workspace = sideBySideWorkspace(for: slot) else { return nil }
+        return renderedImage(for: workspace, showAnnotations: true, showMeasurements: true)
+    }
+
+    func sideBySideDetailText(for slot: MSSideBySideSlot) -> String {
+        guard let workspace = sideBySideWorkspace(for: slot) else {
+            return "No image loaded"
+        }
+
+        let measuredRegions = workspace.annotations.filter { $0.isMeasuredRegion }.count
+        let measurements = workspace.annotations.filter {
+            $0.type == .measurement || $0.type == .calibration || $0.type == .angle || $0.type == .parallelAngle
+        }.count
+
+        return "\(measuredRegions) regions, \(measurements) measurements"
+    }
+
+    func exportSideBySideComparison() {
+        guard let image = renderSideBySideComparisonImage() else {
+            statusMessage = "Add two images to export a comparison"
+            return
+        }
+
+        saveExportImage(
+            image,
+            filename: "MeasureShot Side by Side.png",
+            includeEditableSnapshot: false
+        )
+    }
+
+    private func captureScreenshot(onSuccess: @escaping (NSImage) -> Void) {
         guard !isCapturing else { return }
 
         isCapturing = true
@@ -286,8 +419,7 @@ final class AppState {
 
             switch result {
             case .success(let image):
-                self.addScreenshot(image: image)
-                self.statusMessage = "Capture complete"
+                onSuccess(image)
                 self.showEditor()
 
             case .failure(let error):
@@ -317,9 +449,15 @@ final class AppState {
 
     func addScreenshot(image: NSImage) {
         let nextNumber = screenshotWorkspaces.count + 1
-        let document = ImageDocument(image: image, title: "Screenshot \(nextNumber)")
+        _ = addScreenshot(image: image, title: "Screenshot \(nextNumber)")
+    }
+
+    @discardableResult
+    private func addScreenshot(image: NSImage, title: String) -> UUID {
+        let document = ImageDocument(image: image, title: title)
         addScreenshotWorkspace(for: document)
         resetCanvasStateForNewDocument()
+        return document.id
     }
 
     func insertImage() {
@@ -410,6 +548,52 @@ final class AppState {
         let workspace = ScreenshotWorkspace(document: document)
         screenshotWorkspaces.append(workspace)
         selectedScreenshotID = workspace.id
+    }
+
+    private func hasScreenshot(id: UUID?) -> Bool {
+        guard let id else { return false }
+        return screenshotWorkspaces.contains { $0.id == id }
+    }
+
+    private func setSideBySideScreenshot(id: UUID, for slot: MSSideBySideSlot) {
+        switch slot {
+        case .left:
+            sideBySideLeftScreenshotID = id
+        case .right:
+            sideBySideRightScreenshotID = id
+        }
+        selectedScreenshotID = id
+    }
+
+    private func sideBySideWorkspace(for slot: MSSideBySideSlot) -> ScreenshotWorkspace? {
+        let id = slot == .left ? sideBySideLeftScreenshotID : sideBySideRightScreenshotID
+        guard let id else { return nil }
+        return screenshotWorkspaces.first { $0.id == id }
+    }
+
+    private func defaultSideBySideTitle(for slot: MSSideBySideSlot) -> String {
+        switch slot {
+        case .left:
+            return "Comparison Left"
+        case .right:
+            return "Comparison Right"
+        }
+    }
+
+    private func renderedImage(
+        for workspace: ScreenshotWorkspace,
+        showAnnotations: Bool,
+        showMeasurements: Bool
+    ) -> NSImage? {
+        let image = ImageRenderer.render(document: workspace.document)
+        return ExportRenderer.render(
+            image: image,
+            annotations: workspace.annotations,
+            calibration: workspace.calibration,
+            outputUnit: outputMeasurementUnit,
+            showAnnotations: showAnnotations,
+            showMeasurements: showMeasurements
+        )
     }
 
     func rotateImageClockwise() {
@@ -644,7 +828,7 @@ final class AppState {
             return .text
         case .blur:
             return .blur
-        case .select, .crop, .colourPicker:
+        case .select, .crop, .colourPicker, .sideBySide:
             return nil
         }
     }
@@ -653,7 +837,7 @@ final class AppState {
         switch selectedTool {
         case .measure, .calibrate, .angle, .parallelAngle, .arrow, .rectangle, .ellipse, .pen, .region, .blur:
             return true
-        case .select, .text, .crop, .colourPicker:
+        case .select, .text, .crop, .colourPicker, .sideBySide:
             return false
         }
     }
@@ -966,6 +1150,10 @@ final class AppState {
             Int(rgb.greenComponent * 255),
             Int(rgb.blueComponent * 255)
         )
+        copySampledHex()
+    }
+
+    func copySampledHex() {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(sampledHex, forType: .string)
         statusMessage = "Copied \(sampledHex)"
@@ -1088,30 +1276,305 @@ final class AppState {
         annotations.filter { $0.isMeasuredRegion }
     }
 
+    func measuredItems() -> [MSAnnotation] {
+        annotations.filter {
+            $0.isMeasuredRegion
+                || $0.type == .measurement
+                || $0.type == .calibration
+                || $0.type == .angle
+                || $0.type == .parallelAngle
+        }
+    }
+
+    func measuredItemTitle(for annotation: MSAnnotation) -> String {
+        if annotation.isMeasuredRegion {
+            return regionTitle(for: annotation)
+        }
+
+        if let title = annotation.title,
+           !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return title
+        }
+
+        return defaultMeasuredItemTitle(for: annotation)
+    }
+
+    func compactMeasuredItemTitle(for annotation: MSAnnotation) -> String {
+        if annotation.isMeasuredRegion {
+            return compactRegionTitle(for: annotation)
+        }
+
+        guard let selectedWorkspace else { return "" }
+        return compactMeasurementTitle(for: annotation, in: selectedWorkspace)
+    }
+
+    func inspectorMeasuredItemTitle(for annotation: MSAnnotation) -> String {
+        let compactTitle = compactMeasuredItemTitle(for: annotation)
+        let fullTitle = measuredItemTitle(for: annotation)
+        return compactTitle.isEmpty ? fullTitle : "\(compactTitle): \(fullTitle)"
+    }
+
+    func updateMeasuredItemTitle(id: UUID, title: String) {
+        guard let index = annotations.firstIndex(where: { $0.id == id }) else { return }
+
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        annotations[index].title = trimmed.isEmpty ? nil : title
+        statusMessage = "Renamed measurement"
+    }
+
+    private func defaultMeasuredItemTitle(for annotation: MSAnnotation) -> String {
+        let matchingAnnotations = annotations.filter { $0.type == annotation.type }
+        let index = matchingAnnotations.firstIndex { $0.id == annotation.id } ?? 0
+
+        switch annotation.type {
+        case .measurement:
+            return "Measurement \(index + 1)"
+        case .calibration:
+            return "Calibration \(index + 1)"
+        case .angle:
+            return "Angle \(index + 1)"
+        case .parallelAngle:
+            return "Parallel Angle \(index + 1)"
+        default:
+            return "Measurement \(index + 1)"
+        }
+    }
+
     func regionTitle(for annotation: MSAnnotation) -> String {
         if let title = annotation.title,
            !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return title
         }
 
-        guard annotation.isMeasuredRegion,
-              let index = measuredRegions().firstIndex(where: { $0.id == annotation.id }) else {
-            return ""
-        }
+        return defaultRegionTitle(for: annotation)
+    }
 
-        let title: String
+    func compactRegionTitle(for annotation: MSAnnotation) -> String {
+        guard annotation.isMeasuredRegion else { return "" }
+
+        let matchingRegions = measuredRegions().filter { $0.type == annotation.type }
+        let index = matchingRegions.firstIndex { $0.id == annotation.id } ?? 0
+
         switch annotation.type {
         case .rectangle:
-            title = "Rectangle"
+            return "R\(index + 1)"
         case .ellipse:
-            title = "Ellipse"
+            return "E\(index + 1)"
         case .region:
-            title = "Region"
+            return "ROI\(index + 1)"
         default:
-            title = "Shape"
+            return "M\(index + 1)"
+        }
+    }
+
+    func inspectorRegionTitle(for annotation: MSAnnotation) -> String {
+        let compactTitle = compactRegionTitle(for: annotation)
+        let fullTitle = regionTitle(for: annotation)
+        return compactTitle.isEmpty ? fullTitle : "\(compactTitle): \(fullTitle)"
+    }
+
+    private func defaultRegionTitle(for annotation: MSAnnotation) -> String {
+        guard annotation.isMeasuredRegion else { return "" }
+
+        let matchingRegions = measuredRegions().filter { $0.type == annotation.type }
+        let index = matchingRegions.firstIndex { $0.id == annotation.id } ?? 0
+
+        switch annotation.type {
+        case .rectangle:
+            return "Rectangle \(index + 1)"
+        case .ellipse:
+            return "Ellipse \(index + 1)"
+        case .region:
+            return "Region \(index + 1)"
+        default:
+            return "Shape \(index + 1)"
+        }
+    }
+
+    func computationVariables() -> [MSComputationVariable] {
+        if selectedTool == .sideBySide {
+            let leftVariables = sideBySideWorkspace(for: .left).map {
+                computationVariables(for: $0, expressionPrefix: "Left", displayPrefix: "Left")
+            } ?? []
+            let rightVariables = sideBySideWorkspace(for: .right).map {
+                computationVariables(for: $0, expressionPrefix: "Right", displayPrefix: "Right")
+            } ?? []
+            return leftVariables + rightVariables
         }
 
-        return "\(title) \(index + 1)"
+        guard let selectedWorkspace else { return [] }
+        return computationVariables(for: selectedWorkspace, expressionPrefix: nil, displayPrefix: nil)
+    }
+
+    func addComputationResult(name: String, expression: String, value: Double) {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let result = MSComputationResult(
+            name: trimmedName.isEmpty ? "Computation \(computationResults.count + 1)" : trimmedName,
+            expression: expression,
+            value: value,
+            formattedValue: String(format: "%.4f", value)
+        )
+        computationResults.insert(result, at: 0)
+        latestComparisonResult = nil
+        statusMessage = "Saved computation"
+    }
+
+    func deleteComputationResult(id: UUID) {
+        computationResults.removeAll { $0.id == id }
+        statusMessage = "Deleted computation"
+    }
+
+    func clearComputationResults() {
+        computationResults.removeAll()
+        latestComparisonResult = nil
+        statusMessage = "Cleared computations"
+    }
+
+    private func computationVariables(
+        for workspace: ScreenshotWorkspace,
+        expressionPrefix: String?,
+        displayPrefix: String?
+    ) -> [MSComputationVariable] {
+        workspace.annotations.flatMap { annotation in
+            computationVariables(
+                for: annotation,
+                in: workspace,
+                expressionPrefix: expressionPrefix,
+                displayPrefix: displayPrefix
+            )
+        }
+    }
+
+    private func computationVariables(
+        for annotation: MSAnnotation,
+        in workspace: ScreenshotWorkspace,
+        expressionPrefix: String?,
+        displayPrefix: String?
+    ) -> [MSComputationVariable] {
+        if annotation.isMeasuredRegion {
+            let shortTitle = compactRegionTitle(for: annotation, in: workspace)
+            var variables = [
+                computationVariable(shortTitle: shortTitle, expressionPrefix: expressionPrefix, displayPrefix: displayPrefix, metric: "area", title: "Area", value: convertedArea(annotation.regionAreaSquarePixels, calibration: workspace.calibration), unit: areaUnitSuffix(calibration: workspace.calibration)),
+                computationVariable(shortTitle: shortTitle, expressionPrefix: expressionPrefix, displayPrefix: displayPrefix, metric: "perimeter", title: "Perimeter", value: convertedLength(annotation.regionPerimeterPixels, calibration: workspace.calibration), unit: lengthUnitSuffix(calibration: workspace.calibration)),
+                computationVariable(shortTitle: shortTitle, expressionPrefix: expressionPrefix, displayPrefix: displayPrefix, metric: "width", title: "Width", value: convertedLength(Double(annotation.width), calibration: workspace.calibration), unit: lengthUnitSuffix(calibration: workspace.calibration)),
+                computationVariable(shortTitle: shortTitle, expressionPrefix: expressionPrefix, displayPrefix: displayPrefix, metric: "height", title: "Height", value: convertedLength(Double(annotation.height), calibration: workspace.calibration), unit: lengthUnitSuffix(calibration: workspace.calibration))
+            ]
+
+            if annotation.type == .ellipse {
+                variables.append(contentsOf: [
+                    computationVariable(shortTitle: shortTitle, expressionPrefix: expressionPrefix, displayPrefix: displayPrefix, metric: "radiusX", title: "Radius X", value: convertedLength(Double(annotation.width / 2), calibration: workspace.calibration), unit: lengthUnitSuffix(calibration: workspace.calibration)),
+                    computationVariable(shortTitle: shortTitle, expressionPrefix: expressionPrefix, displayPrefix: displayPrefix, metric: "radiusY", title: "Radius Y", value: convertedLength(Double(annotation.height / 2), calibration: workspace.calibration), unit: lengthUnitSuffix(calibration: workspace.calibration)),
+                    computationVariable(shortTitle: shortTitle, expressionPrefix: expressionPrefix, displayPrefix: displayPrefix, metric: "diameterX", title: "Diameter X", value: convertedLength(Double(annotation.width), calibration: workspace.calibration), unit: lengthUnitSuffix(calibration: workspace.calibration)),
+                    computationVariable(shortTitle: shortTitle, expressionPrefix: expressionPrefix, displayPrefix: displayPrefix, metric: "diameterY", title: "Diameter Y", value: convertedLength(Double(annotation.height), calibration: workspace.calibration), unit: lengthUnitSuffix(calibration: workspace.calibration))
+                ])
+            }
+
+            return variables
+        }
+
+        if annotation.type == .measurement || annotation.type == .calibration {
+            let shortTitle = compactMeasurementTitle(for: annotation, in: workspace)
+            return [
+                computationVariable(shortTitle: shortTitle, expressionPrefix: expressionPrefix, displayPrefix: displayPrefix, metric: "length", title: "Length", value: convertedLength(Double(annotation.length), calibration: workspace.calibration), unit: lengthUnitSuffix(calibration: workspace.calibration))
+            ]
+        }
+
+        if annotation.type == .angle || annotation.type == .parallelAngle {
+            let shortTitle = compactMeasurementTitle(for: annotation, in: workspace)
+            return [
+                computationVariable(shortTitle: shortTitle, expressionPrefix: expressionPrefix, displayPrefix: displayPrefix, metric: "degrees", title: "Degrees", value: annotation.angleDeviationFromReference, unit: "deg")
+            ]
+        }
+
+        return []
+    }
+
+    private func computationVariable(
+        shortTitle: String,
+        expressionPrefix: String?,
+        displayPrefix: String?,
+        metric: String,
+        title: String,
+        value: Double,
+        unit: String
+    ) -> MSComputationVariable {
+        let sourceID = [expressionPrefix, shortTitle].compactMap { $0 }.joined(separator: ".")
+        let sourceTitle = [displayPrefix, shortTitle].compactMap { $0 }.joined(separator: " ")
+        return MSComputationVariable(
+            id: "\(sourceID).\(metric)",
+            sourceID: sourceID,
+            sourceTitle: sourceTitle,
+            metricID: metric,
+            metricTitle: title,
+            value: value,
+            unit: unit
+        )
+    }
+
+    private func compactRegionTitle(for annotation: MSAnnotation, in workspace: ScreenshotWorkspace) -> String {
+        guard annotation.isMeasuredRegion else { return "" }
+
+        let matchingRegions = workspace.annotations.filter { $0.isMeasuredRegion && $0.type == annotation.type }
+        let index = matchingRegions.firstIndex { $0.id == annotation.id } ?? 0
+
+        switch annotation.type {
+        case .rectangle:
+            return "R\(index + 1)"
+        case .ellipse:
+            return "E\(index + 1)"
+        case .region:
+            return "ROI\(index + 1)"
+        default:
+            return "M\(index + 1)"
+        }
+    }
+
+    private func compactMeasurementTitle(for annotation: MSAnnotation, in workspace: ScreenshotWorkspace) -> String {
+        let matchingAnnotations = workspace.annotations.filter { $0.type == annotation.type }
+        let index = matchingAnnotations.firstIndex { $0.id == annotation.id } ?? 0
+
+        switch annotation.type {
+        case .measurement:
+            return "M\(index + 1)"
+        case .calibration:
+            return "C\(index + 1)"
+        case .angle:
+            return "A\(index + 1)"
+        case .parallelAngle:
+            return "PA\(index + 1)"
+        default:
+            return "V\(index + 1)"
+        }
+    }
+
+    private func convertedLength(_ pixels: Double, calibration: MSCalibration?) -> Double {
+        if let calibration,
+           let converted = calibration.convertedLength(forPixels: pixels, to: outputMeasurementUnit) {
+            return converted
+        }
+
+        return pixels
+    }
+
+    private func convertedArea(_ squarePixels: Double, calibration: MSCalibration?) -> Double {
+        if let calibration,
+           let converted = calibration.convertedArea(forSquarePixels: squarePixels, to: outputMeasurementUnit) {
+            return converted
+        }
+
+        return squarePixels
+    }
+
+    private func lengthUnitSuffix(calibration: MSCalibration?) -> String {
+        if calibration != nil || outputMeasurementUnit == .pixels {
+            return outputMeasurementUnit.rawValue
+        }
+
+        return "px"
+    }
+
+    private func areaUnitSuffix(calibration: MSCalibration?) -> String {
+        "\(lengthUnitSuffix(calibration: calibration))^2"
     }
 
     func updateRegionTitle(id: UUID, title: String) {
@@ -1275,6 +1738,8 @@ final class AppState {
         selectedWorkspace?.lastMoveUndoState = nil
         selectedWorkspace?.lastEndpointEditUndoState = nil
         calibration = nil
+        computationResults.removeAll()
+        latestComparisonResult = nil
         outputMeasurementUnit = .centimetres
         zoomScale = 1
         isFitToWindow = true
@@ -1718,6 +2183,7 @@ final class AppState {
             isAnnotationLayerVisible = editableSnapshot.isAnnotationLayerVisible
             isMeasurementLayerVisible = editableSnapshot.isMeasurementLayerVisible
             isGuideLayerVisible = editableSnapshot.isGuideLayerVisible
+            computationResults = editableSnapshot.computationResults
             resetTransientImageEditState()
             statusMessage = "Opened editable export from history"
         } else {
@@ -1780,6 +2246,66 @@ final class AppState {
         currentImage
     }
 
+    private func renderSideBySideComparisonImage() -> NSImage? {
+        guard let left = sideBySideRenderedImage(for: .left),
+              let right = sideBySideRenderedImage(for: .right) else {
+            return nil
+        }
+
+        let padding: CGFloat = 32
+        let labelHeight: CGFloat = 40
+        let targetPaneHeight = max(left.size.height, right.size.height)
+        let leftScale = targetPaneHeight / max(left.size.height, 1)
+        let rightScale = targetPaneHeight / max(right.size.height, 1)
+        let leftSize = CGSize(width: left.size.width * leftScale, height: targetPaneHeight)
+        let rightSize = CGSize(width: right.size.width * rightScale, height: targetPaneHeight)
+        let outputSize = CGSize(
+            width: leftSize.width + rightSize.width + padding * 3,
+            height: targetPaneHeight + labelHeight + padding * 2
+        )
+        let output = NSImage(size: outputSize)
+
+        output.lockFocus()
+        defer { output.unlockFocus() }
+
+        NSColor.white.setFill()
+        NSRect(origin: .zero, size: outputSize).fill()
+
+        drawSideBySideLabel(sideBySideTitle(for: .left), at: CGPoint(x: padding, y: outputSize.height - padding - 24))
+        drawSideBySideLabel(sideBySideTitle(for: .right), at: CGPoint(x: padding * 2 + leftSize.width, y: outputSize.height - padding - 24))
+
+        left.draw(
+            in: NSRect(x: padding, y: padding, width: leftSize.width, height: leftSize.height),
+            from: NSRect(origin: .zero, size: left.size),
+            operation: .copy,
+            fraction: 1
+        )
+        right.draw(
+            in: NSRect(x: padding * 2 + leftSize.width, y: padding, width: rightSize.width, height: rightSize.height),
+            from: NSRect(origin: .zero, size: right.size),
+            operation: .copy,
+            fraction: 1
+        )
+
+        NSColor.separatorColor.setStroke()
+        let divider = NSBezierPath()
+        let dividerX = padding * 1.5 + leftSize.width
+        divider.move(to: CGPoint(x: dividerX, y: padding))
+        divider.line(to: CGPoint(x: dividerX, y: outputSize.height - padding))
+        divider.lineWidth = 2
+        divider.stroke()
+
+        return output
+    }
+
+    private func drawSideBySideLabel(_ label: String, at point: CGPoint) {
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 22, weight: .semibold),
+            .foregroundColor: NSColor.labelColor
+        ]
+        NSAttributedString(string: label, attributes: attributes).draw(at: point)
+    }
+
     private func renderExportImage(showAnnotations: Bool, showMeasurements: Bool) -> NSImage? {
         guard let currentImage else { return nil }
 
@@ -1817,7 +2343,11 @@ final class AppState {
         )
     }
 
-    private func saveExportImage(_ image: NSImage?, filename: String) {
+    private func saveExportImage(
+        _ image: NSImage?,
+        filename: String,
+        includeEditableSnapshot: Bool = true
+    ) {
         guard let image,
               let tiff = image.tiffRepresentation,
               let bitmap = NSBitmapImageRep(data: tiff),
@@ -1838,7 +2368,7 @@ final class AppState {
                 action: .saved,
                 image: image,
                 fileURL: url,
-                editableSnapshot: currentEditableHistorySnapshot()
+                editableSnapshot: includeEditableSnapshot ? currentEditableHistorySnapshot() : nil
             )
             statusMessage = "Export saved"
         } catch {
@@ -2033,17 +2563,19 @@ final class AppState {
             outputMeasurementUnit: outputMeasurementUnit,
             isAnnotationLayerVisible: isAnnotationLayerVisible,
             isMeasurementLayerVisible: isMeasurementLayerVisible,
-            isGuideLayerVisible: isGuideLayerVisible
+            isGuideLayerVisible: isGuideLayerVisible,
+            computationResults: computationResults
         )
     }
 
     private func currentComputationExportLines() -> [String] {
+        let savedLines = computationResults.map(\.exportLine)
         guard let latestComparisonResult,
               !latestComparisonResult.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return []
+            return savedLines
         }
 
-        return [latestComparisonResult]
+        return savedLines + [latestComparisonResult]
     }
 
     private func editableRecord(
@@ -2068,7 +2600,8 @@ final class AppState {
             outputMeasurementUnit: snapshot.outputMeasurementUnit,
             isAnnotationLayerVisible: snapshot.isAnnotationLayerVisible,
             isMeasurementLayerVisible: snapshot.isMeasurementLayerVisible,
-            isGuideLayerVisible: snapshot.isGuideLayerVisible
+            isGuideLayerVisible: snapshot.isGuideLayerVisible,
+            computationResults: snapshot.computationResults
         )
     }
 
@@ -2100,7 +2633,8 @@ final class AppState {
             outputMeasurementUnit: record.outputMeasurementUnit,
             isAnnotationLayerVisible: record.isAnnotationLayerVisible,
             isMeasurementLayerVisible: record.isMeasurementLayerVisible,
-            isGuideLayerVisible: record.isGuideLayerVisible
+            isGuideLayerVisible: record.isGuideLayerVisible,
+            computationResults: record.computationResults ?? []
         )
     }
 

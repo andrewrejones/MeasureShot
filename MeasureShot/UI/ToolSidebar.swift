@@ -9,6 +9,7 @@ private let sidebarHistoryDateFormatter: DateFormatter = {
 
 struct ToolSidebar: View {
     @Environment(AppState.self) private var appState
+    @AppStorage("sidebar.historyBrowserExpanded") private var isHistoryBrowserExpanded = false
     @State private var exportHistoryRange: MSExportHistoryRange = .today
     @State private var exportHistoryDate = Date()
 
@@ -47,10 +48,14 @@ struct ToolSidebar: View {
         VStack(spacing: 4) {
             ForEach(MSToolType.allCases.filter { $0 != .crop }) { tool in
                 Button {
-                    appState.selectedTool = tool
                     appState.cancelAnnotation()
                     appState.resetAngleCreation()
-                    appState.statusMessage = "Selected \(tool.title)"
+                    if tool == .sideBySide {
+                        appState.prepareSideBySideComparison()
+                    } else {
+                        appState.selectedTool = tool
+                        appState.statusMessage = "Selected \(tool.title)"
+                    }
                 } label: {
                     HStack(spacing: 10) {
                         Image(systemName: tool.systemImage)
@@ -76,44 +81,51 @@ struct ToolSidebar: View {
     }
 
     private var historyBrowser: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        DisclosureGroup(isExpanded: $isHistoryBrowserExpanded) {
+            VStack(alignment: .leading, spacing: 10) {
+                Picker("Range", selection: $exportHistoryRange) {
+                    ForEach(MSExportHistoryRange.allCases) { range in
+                        Text(range.title).tag(range)
+                    }
+                }
+                .pickerStyle(.menu)
+                .labelsHidden()
+
+                if exportHistoryRange == .customDay {
+                    DatePicker(
+                        "Date",
+                        selection: $exportHistoryDate,
+                        displayedComponents: [.date]
+                    )
+                    .datePickerStyle(.compact)
+                    .labelsHidden()
+                }
+
+                if filteredHistoryItems.isEmpty {
+                    Text("No exports in this range.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.vertical, 4)
+                } else {
+                    VStack(spacing: 8) {
+                        ForEach(filteredHistoryItems) { item in
+                            historyRow(item)
+                        }
+                    }
+                }
+            }
+            .padding(.top, 8)
+        } label: {
             HStack {
                 Label("History", systemImage: "clock.arrow.circlepath")
                     .font(.subheadline)
                     .fontWeight(.semibold)
 
                 Spacer()
-            }
 
-            Picker("Range", selection: $exportHistoryRange) {
-                ForEach(MSExportHistoryRange.allCases) { range in
-                    Text(range.title).tag(range)
-                }
-            }
-            .pickerStyle(.menu)
-            .labelsHidden()
-
-            if exportHistoryRange == .customDay {
-                DatePicker(
-                    "Date",
-                    selection: $exportHistoryDate,
-                    displayedComponents: [.date]
-                )
-                .datePickerStyle(.compact)
-                .labelsHidden()
-            }
-
-            if filteredHistoryItems.isEmpty {
-                Text("No exports in this range.")
+                Text("\(appState.exportHistory.count)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                    .padding(.vertical, 4)
-            } else {
-                VStack(spacing: 8) {
-                    ForEach(filteredHistoryItems) { item in
-                        historyRow(item)
-                    }
-                }
             }
         }
     }

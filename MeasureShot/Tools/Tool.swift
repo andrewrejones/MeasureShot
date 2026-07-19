@@ -16,6 +16,7 @@ enum MSToolType: String, CaseIterable, Identifiable, Sendable {
     case blur
     case crop
     case colourPicker
+    case sideBySide
 
     var id: String { rawValue }
 
@@ -35,6 +36,7 @@ enum MSToolType: String, CaseIterable, Identifiable, Sendable {
         case .blur: "Blur"
         case .crop: "Crop"
         case .colourPicker: "Colour Picker"
+        case .sideBySide: "Compare"
         }
     }
 
@@ -54,6 +56,7 @@ enum MSToolType: String, CaseIterable, Identifiable, Sendable {
         case .blur: "drop"
         case .crop: "crop"
         case .colourPicker: "eyedropper"
+        case .sideBySide: "rectangle.split.2x1"
         }
     }
 }

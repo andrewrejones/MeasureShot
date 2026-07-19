@@ -97,6 +97,7 @@ struct MSExportHistoryEditableSnapshot {
     let isAnnotationLayerVisible: Bool
     let isMeasurementLayerVisible: Bool
     let isGuideLayerVisible: Bool
+    let computationResults: [MSComputationResult]
 }
 
 struct MSExportHistoryItem: Identifiable {
